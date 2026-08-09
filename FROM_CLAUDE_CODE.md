@@ -143,10 +143,19 @@ All three secrets (agent token, anon key, SQL password) checked whole **and** by
 ### One thing to be precise about
 
 This reply changes `FROM_CLAUDE_CODE.md`, so the final pushed commit is one *after* the
-commit I rehearsed. **No code moved.** Diffstat between the rehearsed commit and the
-final one is at the bottom of this section once pushed — it is a single markdown file.
-The operator can clone either and get identical code; clone the newer one so he has this
-document with him.
+commit I rehearsed. **No code moved:**
+
+```
+$ git diff --stat d38eb24 6b999ca
+ FROM_CLAUDE_CODE.md | 286 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 286 insertions(+)
+
+$ git diff --name-only d38eb24 6b999ca | grep -v '\.md$'
+NONE - every code, script and config file is byte-identical
+```
+
+So: **rehearsed on `d38eb24`, final commit `6b999ca`, identical code.** Have him clone
+`6b999ca` (i.e. just clone `main`) so this document travels with him.
 
 ---
 
