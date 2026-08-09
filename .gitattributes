@@ -1,0 +1,18 @@
+# core.autocrlf=true is set globally on the build machine. Without this file,
+# any checkout would rewrite the locked files to CRLF — changing bytes in files
+# that must not be modified. Pin endings explicitly so checkout is byte-stable
+# on Windows and on the Linux Actions runner alike.
+
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sql   text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+
+# PowerShell is run by Windows; keep CRLF.
+*.ps1   text eol=crlf
+
+*.jpg   binary
+*.png   binary

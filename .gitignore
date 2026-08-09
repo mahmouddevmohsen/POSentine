@@ -8,6 +8,12 @@ state.json
 *.pem
 *.key
 
+# ── Working correspondence — carries live credentials ───────────
+# Docs/ holds the build prompts and replies. Those have already carried
+# the monitor_ro SQL password and, in ksjud7.md, the Supabase JWT secret
+# and service_role key. Structural exclusion, not a habit of remembering.
+Docs/
+
 # ── Customer data — real sales, employees, and cash counts ──────
 # Kept local on purpose. The GitHub Actions runner checks out this
 # repo; the customer's raw POS data must never land there.
