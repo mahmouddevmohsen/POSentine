@@ -98,9 +98,32 @@ from the tests months ago. `MANIFEST.txt` carries a sha256 of every file, and
 
 `config.json` is never bundled. It is placed on the machine separately, by hand.
 
-`ship/` is not complete yet: `install/install_agent.ps1` and `uninstall_agent.ps1`
-do not exist, so it covers VERIFY.md steps 1–6 but not step 7. `make_ship.py` prints
-that in red every time it runs rather than letting the gap go quiet.
+### The scheduled task (VERIFY.md step 7)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install\install_agent.ps1 -ShowXml   # inspect
+powershell -ExecutionPolicy Bypass -File .\install\install_agent.ps1            # register
+powershell -ExecutionPolicy Bypass -File .\install\uninstall_agent.ps1          # remove
+```
+
+The task's 3-minute repetition **is** the agent's loop — `agent.py` runs one cycle per
+invocation and exits, so a dead process is replaced on the next tick and a reboot
+recovers by itself.
+
+| Choice | Why |
+|---|---|
+| Explicit task XML, not `New-ScheduledTrigger` | An indefinite repetition through the cmdlets relies on `[TimeSpan]::MaxValue` surviving a round trip into task XML, which is version-dependent and has a known failure. XML with an `<Interval>` and no `<Duration>` means forever, everywhere — and `-ShowXml` lets it be read before it is registered. |
+| Action is `powershell.exe -WindowStyle Hidden`, not `python.exe` | A console app launched by the scheduler shows its window. A black window on the till every three minutes during service is not acceptable. |
+| Not `pythonw.exe` | Under `pythonw`, `sys.stderr` is `None`, so `agent.py`'s logging `StreamHandler` fails on every record and logging swallows the failure. Silent is the one thing this product may not be. |
+| `install/run_agent.ps1` wrapper | A Scheduled Task action has a command, arguments and a working directory — no environment block. The wrapper is that block: `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`. |
+| The python path is passed in, not written into the wrapper | `run_agent.ps1` is hashed in `MANIFEST.txt`. A script that rewrites itself fails the integrity check `preflight.bat` runs first. |
+| `ExecutionTimeLimit` `PT15M` | `MultipleInstancesPolicy` is `IgnoreNew`, so one hung cycle blocks every later one. 15 minutes matches `agent.py`'s own `LOCK_STALE_SECONDS`, so the task and the agent cannot disagree about when a cycle is dead. |
+| Batteries settings forced to `false` | Both default to `true`. On a till behind a UPS the defaults stop the agent on the first power blip, silently. |
+| `LogonType InteractiveToken`, `RunLevel LeastPrivilege` | The till account is not an administrator. Running while logged off needs a stored password or an admin-granted logon right. The trade-off — cycles stop while logged out — is stated in VERIFY.md step 7 rather than worked around. |
+
+The `.ps1` files are **ASCII-only and saved with a UTF-8 BOM**: Windows PowerShell 5.1
+reads a BOM-less `.ps1` as the system ANSI code page, and one non-ASCII character
+becomes a parse error at a line that looks fine.
 
 ## Baseline check
 

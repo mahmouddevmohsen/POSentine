@@ -257,11 +257,29 @@ It also proves the token that ships is the token that works.
 ## 7 — Install the scheduled task
 
 ```powershell
-.\install\install_agent.ps1
+powershell -ExecutionPolicy Bypass -File .\install\install_agent.ps1
 Get-ScheduledTask -TaskName thirdeyev | Get-ScheduledTaskInfo
 ```
 
+The `-ExecutionPolicy Bypass` is not optional caution — a machine left on the Windows
+default (`Restricted`) refuses to run any `.ps1`, and `.\install\install_agent.ps1`
+fails before it prints anything.
+
+To see exactly what would be registered without registering it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install\install_agent.ps1 -ShowXml
+```
+
+The script is **idempotent** — running it twice replaces the task, never adds a second.
+It registers **user-level, LeastPrivilege, never SYSTEM**, reads the task back from the
+scheduler and checks it, and **stops** if registration fails on privileges rather than
+falling back to something weaker.
+
 Expect `LastTaskResult : 0`.
+
+**STOP IF** it refuses because `config.json` is missing. That is deliberate: a task
+installed before step 6 fails every three minutes into a log nobody is reading yet.
 
 Wait three minutes, then:
 
@@ -275,6 +293,13 @@ heartbeat than the one from step 6.
 
 **STOP IF** `LastTaskResult` is not 0, or no new heartbeat appeared. The task is
 registered but not running, and nothing will arrive after you leave.
+
+> **Tell the owner:** the task runs **at logon and only while the till user is logged
+> on**. Running while logged off needs either a stored password or an administrator to
+> grant a logon right, and this account has neither — so this is the correct choice,
+> not a shortcut. If the machine is ever logged out, cycles stop until someone logs
+> back in. The 3-minute repetition then resumes by itself; nothing is lost, because
+> the watermark only ever moves forward.
 
 ---
 
@@ -348,7 +373,7 @@ If any line differs, photograph the screen and send the row. **Do not adjust any
 ## Uninstall
 
 ```powershell
-.\install\uninstall_agent.ps1
+powershell -ExecutionPolicy Bypass -File .\install\uninstall_agent.ps1
 ```
 
 Removes the task and stops the agent. Uploaded data is untouched, and the POS database

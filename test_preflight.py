@@ -342,6 +342,50 @@ def test_everything_the_agent_imports_is_shipped():
         assert required in shipped
 
 
+def _local_imports(path):
+    """Repository modules a file imports **at module level**.
+
+    Module level only, deliberately. Those resolve the moment the file is
+    loaded, so a missing one is an ImportError before the agent does
+    anything. An import inside a function is reachable surface, not startup
+    surface — `agent.py` imports `fake_adapter` that way, under `--fake`,
+    and that module is excluded from ship/ on purpose: synthetic data has no
+    place on a production machine.
+    """
+    import ast
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    return {n for n in names if (P.HERE / f"{n}.py").exists()}
+
+
+@pytest.mark.parametrize("entry", ["agent.py", "preflight.py", "test_golden.py"])
+def test_the_ship_list_is_closed_under_import(entry):
+    """Derived from the source, not from a list someone maintains by hand.
+
+    This exists because `mint_agent_token.py` reads like dead weight on the
+    customer machine — the token is minted on our machine, and that file's
+    CLI is never used there. It is not dead weight: agent.py imports it at
+    module level (line ~48) and Config.load calls assert_is_agent_token, the
+    check that refuses a service_role key. Deleting it from ship/ produces
+    `ModuleNotFoundError: No module named 'mint_agent_token'` on the till,
+    at install time. Whoever next decides that file looks unnecessary should
+    be stopped here rather than on site.
+    """
+    import make_ship as S
+    shipped = {name for name, _ in S.SHIPPED}
+    missing = sorted(f"{m}.py" for m in _local_imports(P.HERE / entry)
+                     if f"{m}.py" not in shipped)
+    assert not missing, (
+        f"{entry} imports {missing}, which ship/ does not contain. "
+        "The agent would raise ImportError on the customer machine."
+    )
+
+
 def test_the_golden_baseline_needs_pytest_on_that_machine():
     """VERIFY.md step 3 and preflight both run pytest there, so it has to be
     a declared dependency of the customer machine, not an assumption."""

@@ -69,6 +69,11 @@ SHIPPED: tuple[tuple[str, str], ...] = (
     ("VERIFY.md", "the acceptance procedure, steps 1-10"),
     ("requirements.txt", "pyodbc, requests, pytest"),
     ("config.example.json", "the shape of config.json, with no secrets in it"),
+
+    # ── the scheduled task, VERIFY.md step 7 ────────────────────
+    ("install/install_agent.ps1", "registers the task; -ShowXml to inspect first"),
+    ("install/uninstall_agent.ps1", "removes the task; leaves data untouched"),
+    ("install/run_agent.ps1", "what the task executes; the task's environment block"),
 )
 
 # Deliberately absent, and named so their absence is a decision rather than
@@ -85,10 +90,7 @@ EXCLUDED: tuple[tuple[str, str], ...] = (
 
 # Needed by VERIFY.md but not built yet. Printed loudly at the end: a ship
 # folder that is silently incomplete is worse than one that says so.
-NOT_YET_BUILT: tuple[tuple[str, str], ...] = (
-    ("install/install_agent.ps1", "VERIFY.md step 7 — scheduled task"),
-    ("install/uninstall_agent.ps1", "VERIFY.md uninstall"),
-)
+NOT_YET_BUILT: tuple[tuple[str, str], ...] = ()
 
 FORBIDDEN = ("config.json", "state.json", ".env")
 
@@ -129,7 +131,9 @@ def clear_ship() -> None:
         for line in manifest.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
-                known.add(line.split(None, 1)[1].strip())
+                # Only the top-level name matters here: iterdir() sees the
+                # directory, not the files inside it.
+                known.add(line.split(None, 1)[1].strip().split("/")[0])
 
     # Our own tooling's droppings — running the golden baseline inside ship/
     # to check it stands alone leaves both of these behind.
@@ -154,6 +158,7 @@ def build() -> int:
     for name, _why in SHIPPED:
         source = HERE / name
         target = SHIP / name
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         # Copied, then compared. shutil.copy2 does not verify, and a
         # truncated copy that nobody checked is how the wrong code ends up
@@ -195,13 +200,19 @@ def build() -> int:
     for name, why in EXCLUDED:
         print(f"    {name:<34} {why}")
     print()
-    print("  ⚠ NOT COMPLETE YET — these are required by VERIFY.md and do")
-    print("    not exist in the repository:")
-    for name, why in NOT_YET_BUILT:
-        print(f"      {name:<32} {why}")
-    print()
-    print("    This folder covers VERIFY.md steps 1–6. Step 7 (the scheduled")
-    print("    task) cannot be done from it until those are written.")
+    if NOT_YET_BUILT:
+        print("  ⚠ NOT COMPLETE YET — these are required by VERIFY.md and do")
+        print("    not exist in the repository:")
+        for name, why in NOT_YET_BUILT:
+            print(f"      {name:<32} {why}")
+        print()
+        print("    A visit run from this folder will stop at the step that")
+        print("    needs them.")
+    else:
+        print("  ✔ Complete for VERIFY.md steps 1–8: preflight, the agent,")
+        print("    the golden baseline, and the scheduled task.")
+        print("    Step 9 (go-live) is two SQL statements run from our side,")
+        print("    not on this machine, and is deliberately not in here.")
     print("=" * 66)
     return 0
 
