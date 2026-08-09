@@ -134,6 +134,8 @@ class PullResult:
     max_salid: int = 0
     max_saledeid: int = 0
     unknown_sal_t: list[int] = field(default_factory=list)
+    # اتوصل لسقف الدورة → فيه متراكم لسه. الباقي بينزل في الدورات الجاية.
+    new_capped: bool = False
 
 
 # ════════════════════════════════════════════════════════════════
@@ -288,7 +290,9 @@ def pull(cn,
          watermark_salid: int,
          rescan_from_salid: int,
          do_rescan: bool,
-         do_reference: bool) -> PullResult:
+         do_reference: bool,
+         *,
+         max_new_invoices: int | None = None) -> PullResult:
     """
     دورة قراءة واحدة.
 
@@ -296,6 +300,12 @@ def pull(cn,
     rescan_from_salid : بداية نافذة الـ24 ساعة (بالـsalid مش بالتاريخ)
     do_rescan         : كل 15 دقيقة تقريباً
     do_reference      : لقطة الأصناف والمستخدمين (كل ساعة يكفي)
+    max_new_invoices  : سقف الدورة — بيحدّ **شغل السيرفر** مش الرفع بس
+
+    ⚠️ من غير السقف، الاستعلام مفتوح: بعد انقطاع شهر بيحاول يجيب ~15,000 فاتورة
+       (و~240 دورة سحب سطور) من SQL Server قبل ما أي حد يقدر يقصّها.
+       `ORDER BY salid` موجود أصلاً فـTOP بيبقى محدد النتيجة (deterministic)،
+       والباقي بينزل في الدورات الجاية.
     """
     cur = cn.cursor()
     res = PullResult()
@@ -323,17 +333,34 @@ def pull(cn,
     # ── الفواتير الجديدة ──────────────────────────────────────
     # حارس الـdirty read: NOLOCK ممكن يقرا صف لسه بيتكتب وبعدين يترجع،
     # وده بيولّد تنبيه "فاتورة اتمسحت" وهي معملتش أصلاً.
-    cur.execute(
-        f"SELECT {_INV_COLS} FROM dbo.Sales s WITH (NOLOCK) "
-        f"WHERE s.salid > ? AND s.saldate < DATEADD(second, -?, GETDATE()) "
-        f"ORDER BY s.salid",
-        watermark_salid, DIRTY_READ_GUARD_SECONDS,
-    )
+    # TOP (?) بـparameter مش بتركيب نص — القيمة جاية من الإعدادات، بس القاعدة
+    # إن أي قيمة تدخل استعلام تدخله كـparameter تفضل بلا استثناء.
+    if max_new_invoices is not None:
+        cap = int(max_new_invoices)
+        if cap <= 0:
+            raise AdapterError(f"max_new_invoices لازم يكون أكبر من صفر، جه {cap}")
+        cur.execute(
+            f"SELECT TOP (?) {_INV_COLS} FROM dbo.Sales s WITH (NOLOCK) "
+            f"WHERE s.salid > ? AND s.saldate < DATEADD(second, -?, GETDATE()) "
+            f"ORDER BY s.salid",
+            cap, watermark_salid, DIRTY_READ_GUARD_SECONDS,
+        )
+    else:
+        cap = None
+        cur.execute(
+            f"SELECT {_INV_COLS} FROM dbo.Sales s WITH (NOLOCK) "
+            f"WHERE s.salid > ? AND s.saldate < DATEADD(second, -?, GETDATE()) "
+            f"ORDER BY s.salid",
+            watermark_salid, DIRTY_READ_GUARD_SECONDS,
+        )
     for r in cur.fetchall():
         inv, unknown = _row_to_invoice(r)
         res.new_invoices.append(inv)
         if unknown is not None:
             res.unknown_sal_t.append(unknown)
+
+    # وصلنا السقف → فيه متراكم. لازم يبان في اللوج، مش يفضل صامت.
+    res.new_capped = cap is not None and len(res.new_invoices) >= cap
 
     if res.new_invoices:
         res.new_lines = _fetch_lines_for(cur, [i.salid for i in res.new_invoices])

@@ -158,7 +158,8 @@ def raw_counts(_cn, watermark_salid: int) -> tuple[int, int]:
 
 
 def pull(cn, watermark_salid: int, rescan_from_salid: int,
-         do_rescan: bool, do_reference: bool) -> PullResult:
+         do_rescan: bool, do_reference: bool, *,
+         max_new_invoices: int | None = None) -> PullResult:
     invoices, lines = _dataset()
     res = PullResult()
     res.pos_clock = _dt.datetime.combine(BASE_DAY, _dt.time(18, 0))
@@ -169,7 +170,15 @@ def pull(cn, watermark_salid: int, rescan_from_salid: int,
         raise RestoreSuspected(
             f"MAX(salid)={res.max_salid} < watermark={watermark_salid}")
 
-    fresh = [i for i in invoices if i.salid > watermark_salid]
+    fresh = sorted((i for i in invoices if i.salid > watermark_salid),
+                   key=lambda i: i.salid)
+    cap = None
+    if max_new_invoices is not None:
+        cap = int(max_new_invoices)
+        if cap <= 0:
+            raise AdapterError(f"max_new_invoices must be > 0, got {cap}")
+        fresh = fresh[:cap]
+    res.new_capped = cap is not None and len(fresh) >= cap
     res.new_invoices = fresh
     fresh_ids = {i.salid for i in fresh}
     res.new_lines = [ln for ln in lines if ln.salid in fresh_ids]

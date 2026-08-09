@@ -16,6 +16,7 @@
   },
 
   "sync_seconds": 180,
+  "max_new_invoices_per_cycle": 5000,
   "rescan_every_n_cycles": 5,
   "reference_every_n_cycles": 20
 }

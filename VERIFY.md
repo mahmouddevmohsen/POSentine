@@ -93,21 +93,40 @@ appears, and that check returns "safe" for an actual service_role key.
 python agent.py --dry-run
 ```
 
-### On a first install
+### 4a — On a first install (no `state.json` yet)
 
-Expect a block headed `FIRST RUN (nothing is written, anywhere)` telling you which
-`watermark_salid` a real run would adopt.
+Expect a block headed **`FIRST RUN (nothing is written, anywhere)`**, naming the
+`watermark_salid` a real run would adopt. It should **not** print an
+`invoices to upload` line at all.
 
-**This is correct.** A fresh install adopts the current `MAX(salid)` and reads nothing
-behind it. History is not backfilled by design — reading it would drag the whole sales
+That is correct. A fresh install adopts the current `MAX(salid)` and reads nothing
+behind it. History is not backfilled by design: reading it would drag the whole sales
 table across during service, and we never report on data recorded before we started
 watching.
 
-**STOP IF** you instead see `invoices to upload` in the **thousands** on a first
-install. That means the first-run guard did not fire and the agent is about to pull the
-entire history. Call.
+> ### 🛑 The one failure the step-5 verdict cannot catch
+>
+> **On a first install, the expected number of invoices to read is `0`.**
+>
+> If you see a `DRY RUN` block instead of a `FIRST RUN` block, and
+> `invoices to upload` shows **hundreds or thousands** (the real database holds about
+> **218,000** invoices and **481,000** lines), then first-run initialisation did not
+> take, and the agent is about to pull the entire history during service.
+>
+> **The step-5 verdict will say PASS.** It compares what the agent would read against a
+> bare `COUNT(*)`, and on a fresh install with `watermark_salid = 0` both numbers are
+> the whole table. They agree, and they are both wrong. `delta 0` here is not a pass —
+> it is two identical wrong answers.
+>
+> **The number to check is not the delta. It is `invoices to upload`, and on a first
+> install it must be `0`.**
+>
+> **STOP. Do not run `python agent.py`. Photograph the block and call.**
+>
+> Most likely cause: a `state.json` left behind from a previous attempt with
+> `"initialised": true` but `"watermark_salid": 0`. Do not edit it yourself.
 
-Run it once more after step 6 to see the normal block below.
+Run this step again after step 6 to see the normal block below.
 
 ### On an already-installed agent
 

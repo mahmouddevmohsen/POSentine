@@ -113,6 +113,7 @@ class Config:
     sync_seconds: int = 180
     rescan_every_n_cycles: int = 5
     reference_every_n_cycles: int = 20
+    max_new_invoices_per_cycle: int = MAX_INVOICES_PER_CYCLE
 
     @staticmethod
     def load(path: Path) -> "Config":
@@ -150,6 +151,8 @@ class Config:
             sync_seconds=int(raw.get("sync_seconds", 180)),
             rescan_every_n_cycles=int(raw.get("rescan_every_n_cycles", 5)),
             reference_every_n_cycles=int(raw.get("reference_every_n_cycles", 20)),
+            max_new_invoices_per_cycle=int(
+                raw.get("max_new_invoices_per_cycle", MAX_INVOICES_PER_CYCLE)),
         )
 
 
@@ -327,6 +330,7 @@ class CycleResult:
     watermark_target: int = 0
     capped: bool = False
     new_invoice_count: int = 0
+    cap: int = MAX_INVOICES_PER_CYCLE
 
 
 def _merge(primary: list, extra: list, key) -> list:
@@ -348,14 +352,17 @@ def build_cycle(adapter, cn, cfg: Config, state: State,
                     or not state.products
                     or state.cycle_index % cfg.reference_every_n_cycles == 0)
 
+    # The ceiling is enforced in the SQL (SELECT TOP), so it bounds the
+    # POS server's work — not merely how much we upload afterwards.
     pulled = adapter.pull(cn,
                           watermark_salid=state.watermark_salid,
                           rescan_from_salid=state.rescan_from_salid,
                           do_rescan=do_rescan,
-                          do_reference=do_reference)
+                          do_reference=do_reference,
+                          max_new_invoices=cfg.max_new_invoices_per_cycle)
 
     result = CycleResult(did_rescan=do_rescan, did_reference=do_reference,
-                         pull=pulled)
+                         pull=pulled, cap=cfg.max_new_invoices_per_cycle)
 
     products = dict(state.products)
     if pulled.products:
@@ -368,24 +375,29 @@ def build_cycle(adapter, cn, cfg: Config, state: State,
     # ── the per-cycle ceiling ───────────────────────────────────
     new_invoices = sorted(pulled.new_invoices, key=lambda i: i.salid)
     result.new_invoice_count = len(new_invoices)
-    if len(new_invoices) > MAX_INVOICES_PER_CYCLE:
-        result.capped = True
-        new_invoices = new_invoices[:MAX_INVOICES_PER_CYCLE]
+    result.capped = bool(pulled.new_capped)
+    if result.capped:
+        # "capped at N" and "found exactly N" are indistinguishable without
+        # this. A backlog that drains quietly forever is a backlog nobody
+        # ever looks at.
         LOG.warning(
-            "backlog: %d new invoices waiting, cap is %d — uploading the "
-            "oldest %d this cycle and the rest will follow. A backlog that "
-            "persists across cycles means the agent was down for a long time.",
-            result.new_invoice_count, MAX_INVOICES_PER_CYCLE, len(new_invoices))
-    kept = {i.salid for i in new_invoices}
-    new_lines = [ln for ln in pulled.new_lines if ln.salid in kept]
+            "backlog: the cycle hit its ceiling of %d new invoices. The "
+            "remainder follows on later cycles. A backlog that persists "
+            "across many cycles means the agent was down for a long time.",
+            cfg.max_new_invoices_per_cycle)
+        result.anomalies.append(("backlog", {
+            "cap": cfg.max_new_invoices_per_cycle,
+            "pulled": result.new_invoice_count,
+            "from_salid": state.watermark_salid}))
 
-    # Follow what was read, never MAX(salid) over the table.
+    # Follow what was actually read, never MAX(salid) over the table — the
+    # capped remainder must still be above the watermark next cycle.
     result.watermark_target = (max(i.salid for i in new_invoices)
                                if new_invoices else state.watermark_salid)
 
     invoices = _merge(new_invoices, pulled.rescanned_invoices,
                       lambda i: i.salid)
-    lines = _merge(new_lines, pulled.rescanned_lines,
+    lines = _merge(pulled.new_lines, pulled.rescanned_lines,
                    lambda ln: ln.saledeid)
 
     # An item we have never seen must not silently become list_price 0.
@@ -557,6 +569,11 @@ def print_dry_run(result: CycleResult, state: State, driver: str,
     w(f"  rescan this cycle    {result.did_rescan}")
     w(f"  reference this cycle {result.did_reference}")
     w("")
+    if result.capped:
+        w(f"  ⚠ CEILING HIT       this cycle read its maximum of "
+          f"{result.new_invoice_count} new invoices;")
+        w("                       a backlog is still waiting behind it")
+        w("")
     w(f"  invoices to upload   {len(result.invoices)}")
     w(f"  lines to upload      {len(result.lines)}")
     w(f"  cash counts          {len(result.cash)}")
@@ -631,7 +648,7 @@ def _print_comparison(result: CycleResult, state: State, w) -> None:
 
     if result.capped:
         w(f"  VERDICT: CAPPED — {new_inv} of {raw_inv} this cycle "
-          f"(ceiling {MAX_INVOICES_PER_CYCLE}).")
+          f"(ceiling {result.cap}).")
         w("  The remainder follows on later cycles. Expected only after an")
         w("  outage; on a fresh install it means Day Zero did not run.")
     elif delta < 0:
@@ -656,6 +673,19 @@ def _print_comparison(result: CycleResult, state: State, w) -> None:
 # ════════════════════════════════════════════════════════════════
 # confirmation — read back what landed, on this screen
 # ════════════════════════════════════════════════════════════════
+
+def _note_kind(note: str | None) -> str | None:
+    """
+    heartbeats.note is the agent's only anomaly channel. An unparseable one
+    is itself worth knowing about, so it is never silently skipped.
+    """
+    if not note:
+        return None
+    try:
+        return json.loads(note).get("kind")
+    except (ValueError, AttributeError):
+        return "unparseable_note"
+
 
 def confirm(client: supa.Supa, cfg: Config, out=None) -> int:
     """
@@ -724,6 +754,17 @@ def confirm(client: supa.Supa, cfg: Config, out=None) -> int:
         problems.append(
             f"{null_price} line(s) have no list_price. Zero-invoice detection "
             "cannot see them. Send us the unknown_item notes above.")
+
+    # A ceiling that keeps being hit means the backlog is not draining.
+    # Without naming it, a capped cycle looks the same as a busy one.
+    for beat in beats:
+        kind = _note_kind(beat.get("note"))
+        if kind == "backlog":
+            problems.append(
+                "a recent cycle hit its per-cycle ceiling — a backlog is "
+                "still draining. Expected after an outage; if it is still "
+                "here in an hour, tell us.")
+            break
 
     w("")
     if problems:

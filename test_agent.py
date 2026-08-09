@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -573,19 +574,93 @@ def test_second_run_after_initialisation_pulls_normally(paths):
 # 9b) 🔴 a per-cycle ceiling, and a watermark that never overshoots
 # ════════════════════════════════════════════════════════════════
 
-def test_cycle_is_capped_and_the_cap_is_logged(paths, caplog):
-    client = FakeSupa()
-    state = fresh_state()
-    A.MAX_INVOICES_PER_CYCLE = 10
-    try:
-        A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
-    finally:
-        A.MAX_INVOICES_PER_CYCLE = 5000
+def test_the_cap_is_applied_by_the_server_and_flagged(paths):
+    """
+    The ceiling is now enforced in the SQL (SELECT TOP), so it bounds the
+    POS's work rather than only our upload. The flag matters because
+    'capped at N' and 'found exactly N' are otherwise indistinguishable,
+    and a persistent backlog would drain quietly forever.
+    """
+    cfg = replace(CFG, max_new_invoices_per_cycle=10)
+    result = A.build_cycle(fake_adapter, None, cfg, fresh_state(), NOW)
 
-    uploaded = dict((t, n) for t, n in client.upserts)
-    assert uploaded["invoices"] <= 10 + 45, "rescan rows are separate"
-    assert any("cap" in r.message.lower() or "backlog" in r.message.lower()
-               for r in caplog.records), "a persistent backlog must be visible"
+    assert result.new_invoice_count == 10, "exactly the cap, not more"
+    assert result.capped is True
+    assert result.pull.new_capped is True
+
+
+def test_an_uncapped_cycle_is_not_flagged(paths):
+    cfg = replace(CFG, max_new_invoices_per_cycle=5000)
+    result = A.build_cycle(fake_adapter, None, cfg, fresh_state(), NOW)
+    assert result.capped is False
+    assert result.pull.new_capped is False
+
+
+def test_the_backlog_drains_one_cap_at_a_time(paths):
+    """
+    The watermark advances by exactly what was pulled, so the remainder is
+    still above it next cycle. Without this the capped remainder would be
+    skipped permanently.
+    """
+    cfg = replace(CFG, max_new_invoices_per_cycle=10)
+    state = fresh_state()
+
+    A.run_once(cfg, state, paths, fake_adapter, FakeSupa(), NOW, False)
+    first = state.watermark_salid
+    assert first == 1009
+
+    A.run_once(cfg, state, paths, fake_adapter, FakeSupa(), NOW, False)
+    assert state.watermark_salid == 1019, "the next ten, not a re-read"
+    assert state.watermark_salid > first
+
+
+def test_a_capped_cycle_reports_a_backlog_anomaly(paths):
+    """--confirm has no other way to see that a backlog exists."""
+    cfg = replace(CFG, max_new_invoices_per_cycle=10)
+    client = FakeSupa()
+    A.run_once(cfg, fresh_state(), paths, fake_adapter, client, NOW, False)
+
+    beats = [r for t, rowset in client.inserts if t == "heartbeats" for r in rowset]
+    kinds = [json.loads(b["note"])["kind"] for b in beats if b["note"]]
+    assert "backlog" in kinds
+
+
+def test_confirm_names_a_backlog_explicitly(capsys):
+    client = ReadbackSupa(beats=[{
+        "at": "2026-08-09T03:00:00+00:00", "ok": False, "drift_seconds": 0,
+        "rows_pulled": 0,
+        "note": json.dumps({"kind": "backlog", "detail": {"remaining": 900}})}])
+    assert A.confirm(client, CFG) == A.EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "per-cycle ceiling" in out, "must name it, not just echo the note"
+    assert "still draining" in out
+
+
+def test_confirm_flags_an_unparseable_note_rather_than_skipping_it(capsys):
+    """A note we cannot read is itself a finding."""
+    client = ReadbackSupa(beats=[{
+        "at": "2026-08-09T03:00:00+00:00", "ok": True, "drift_seconds": 0,
+        "rows_pulled": 1, "note": "{not json"}])
+    assert A._note_kind("{not json") == "unparseable_note"
+    A.confirm(client, CFG)
+
+
+def test_dry_run_shows_the_ceiling_was_hit(paths, capsys):
+    cfg = replace(CFG, max_new_invoices_per_cycle=10)
+    A.run_once(cfg, fresh_state(), paths, fake_adapter, FakeSupa(), NOW,
+               dry_run=True)
+    out = capsys.readouterr().out
+    assert "CEILING HIT" in out
+    assert "CAPPED" in out
+    assert "ceiling 10" in out, "must print the configured cap, not the default"
+    assert "ceiling 5000" not in out
+
+
+def test_cycle_is_capped_and_the_cap_is_logged(paths, caplog):
+    caplog.set_level("WARNING")
+    cfg = replace(CFG, max_new_invoices_per_cycle=10)
+    A.run_once(cfg, fresh_state(), paths, fake_adapter, FakeSupa(), NOW, False)
+    assert any("backlog" in r.message.lower() for r in caplog.records),         "a persistent backlog must be visible in the log"
 
 
 def test_watermark_never_passes_an_invoice_we_did_not_read(paths):
@@ -596,13 +671,9 @@ def test_watermark_never_passes_an_invoice_we_did_not_read(paths):
     them within 15 minutes, but a report built in between would be short.
     The watermark follows what was actually pulled.
     """
-    client = FakeSupa()
+    cfg = replace(CFG, max_new_invoices_per_cycle=10)
     state = fresh_state()
-    A.MAX_INVOICES_PER_CYCLE = 10
-    try:
-        A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
-    finally:
-        A.MAX_INVOICES_PER_CYCLE = 5000
+    A.run_once(cfg, state, paths, fake_adapter, FakeSupa(), NOW, False)
 
     assert state.watermark_salid < 1104, "must not skip the uncapped remainder"
     assert state.watermark_salid == 1009
