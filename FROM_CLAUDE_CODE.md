@@ -4,6 +4,292 @@ Newest section at the top.
 
 ---
 
+# 2026-08-10 01:00 UTC — SIGN-OFF. Last run green. Three answers.
+
+Everything below is raw output. Nothing is green that I had to explain.
+
+---
+
+## The last run
+
+### 1. Full suite
+
+```
+$ python -m pytest -q
+........................................................................ [ 92%]
+.......................                                                  [100%]
+311 passed in 5.80s
+```
+
+### 2. Golden baseline
+
+```
+$ python -m pytest -q test_golden.py
+...............................                                          [100%]
+31 passed in 0.06s
+```
+
+### 3. Locked files — every change since before this work began
+
+```
+$ git diff --stat 5926951 HEAD -- adapter_hdsoft.py metrics.py events.py \
+                                   report.py test_golden.py schema.sql
+ adapter_hdsoft.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+```
+
+The whole of it — your wiring patch, and nothing else:
+
+```diff
++import sqlguard
+@@
+     cn.autocommit = True
+-    return cn
++    # نقطة الاختناق: كل أمر بيعدي على sqlguard.assert_read_only قبل ما
++    # يوصل للسيرفر. مش قاعدة مراجعة - مسار كود بيرمي استثناء.
++    return sqlguard.guard(cn)
+```
+
+`metrics.py`, `events.py`, `report.py`, `test_golden.py`, `schema.sql`: **zero changes.**
+
+### 4. `ship/` regenerated and verified
+
+```
+files in MANIFEST.txt: 25
+mismatches: NONE
+sqlguard.py present: True | 7c2c0962c7d6e11c1a8f4076161837eec84308e4fe62ed69e687a5805cff8078
+adapter_hdsoft.py   : c67cd4913c843e3c41f8ee2d463c7e420e53ee6f02a505ce37cf406d73e08195
+```
+
+`c67cd491…` is the **guarded** adapter (the pre-patch copy was `f75ef36e…`).
+
+### 5. 🎯 The commit the operator will clone
+
+```
+d38eb247110d037fe402099480856b6cf6a80af5
+```
+
+Short form **`d38eb24`**. Local `HEAD` and `origin/main` are the same object.
+
+### 6. Fresh-clone rehearsal — from GitHub, from that commit
+
+```
+$ git clone https://github.com/mahmouddevmohsen/POSentine.git final
+$ git rev-parse HEAD
+d38eb247110d037fe402099480856b6cf6a80af5
+--- does it match what we pushed? ---
+YES - identical to origin/main d38eb24
+```
+
+Then a real `config.json` with a minted 279-character token, and the one-click entry
+point:
+
+```
+  code integrity   OK — clean checkout of commit d38eb247110d
+
+  VERIFY.md step 1 — console and Python
+  [ OK ] Python 3.11.15
+  [ OK ] console encoding utf-8
+
+  VERIFY.md step 2 — dependencies
+  [ OK ] requirements installed
+         pyodbc 5.3.0
+         drivers ['SQL Server']
+  [ OK ] picked SQL Server
+
+  VERIFY.md step 3 — config and token
+  [ OK ] TOKEN OK — role is 'authenticated' and tenant_id matches config
+  [ OK ] sql block complete — monitor_ro@localhost\HDSOFT/HD_Rest_Cashier
+  [ OK ] golden baseline: 31 passed          <-- run on the cloned machine
+
+  VERIFY.md step 3b — read-only proof
+         attempting UPDATE, DELETE and INSERT against the POS database.
+```
+
+and the stop, which **is** the pass condition here:
+
+```
+  Failed in PHASE A — VERIFY.md step 3b — read-only proof
+
+  WHAT FAILED
+    could not connect to the POS database: ('08001', '[08001] [Microsoft][ODBC SQL
+    Server Driver][DBNETLIB]SQL Server does not exist or access denied. (17)
+    (SQLDriverConnect); ... ConnectionOpen (Connect()). (67)')
+
+  WHAT TO DO
+    Check the sql block in config.json against the
+    machine's actual SQL Server instance name.
+    Photograph this and call.
+
+  THE STATE OF THIS MACHINE
+    Nothing was written to the POS or to the cloud, and
+    no scheduled task was registered. This machine is
+    exactly as it was before you double-clicked.
+
+=== installer exit = 1 ===
+```
+
+### 7. Transcript and diagnostics, from that same clone
+
+```
+TRANSCRIPT  install_20260810_005359.txt  123 lines   secrets: NONE
+ZIP         diagnostics_20260810_005453.zip  11 files, 6 KB
+            config.json present: False   secrets: NONE
+```
+
+All three secrets (agent token, anon key, SQL password) checked whole **and** by leading
+24-character fragment. Absent from both.
+
+### One thing to be precise about
+
+This reply changes `FROM_CLAUDE_CODE.md`, so the final pushed commit is one *after* the
+commit I rehearsed. **No code moved.** Diffstat between the rehearsed commit and the
+final one is at the bottom of this section once pushed — it is a single markdown file.
+The operator can clone either and get identical code; clone the newer one so he has this
+document with him.
+
+---
+
+## 1. What I need from you before he stands at that machine
+
+Four things, in the order they will stop him.
+
+**a) The exact SQL connection details.** `config.example.json` guesses
+`localhost\HDSOFT` and `HD_Rest_Cashier`. If either is wrong, he stops at step 3b with
+the block above — which is a clean stop, but it is a stop, and it is *the single most
+likely one*. If anyone can read the instance name off that machine, or off an HD Soft
+config file, before the visit, it removes the top risk entirely.
+
+**b) Confirmation that `monitor_ro` exists, its password, and that Mixed Mode
+authentication is ON.** SQL Server ships Windows-auth-only. If Mixed Mode was never
+enabled, `monitor_ro` cannot log in at all, and fixing it needs a SQL Server
+administrator and a service restart — not something to discover at a counter.
+
+**c) 🔴 Confirm the `sync_state` row exists in Supabase for this `tenant_id` +
+`source_id`.** This one is ours, it is invisible from the till, and it looks like a POS
+problem when it is not. `reconcile_with_cloud` **refuses to run** without that row:
+
+> `no sync_state row for this tenant/source. That is a provisioning problem, not an
+> empty history — refusing to treat it as a first install, which would skip everything
+> already synced.`
+
+That refusal is correct and I would not soften it. But it costs a trip if it is
+discovered on site. One `select` from our side settles it.
+
+**d) A prepared `config.json`, handed over as a file.** Do not have him type or paste a
+279-character JWT into anything. Put the finished file on the USB stick next to the
+folder. Every failure mode of hand-editing that we catch, we catch *after* he has
+already made the mistake.
+
+Optional but worth two minutes: confirm the till account can register a scheduled task.
+I proved it works for a non-administrator on *this* machine; a managed machine with
+group policy is a different question, and the installer stops cleanly if it cannot.
+
+---
+
+## 2. What I would do differently if this were tomorrow rather than today
+
+**I would not change the code.** It is where I want it, and changing anything now trades
+a known state for an unknown one the day before a visit — the same reasoning you applied
+to `monitor_ro.sql`, and I think it applies here too.
+
+What I would change is the **preparation**, all of it off the critical path:
+
+- **Send the four items above ahead of the visit**, especially (c). Three of the top five
+  risks below disappear if a) and b) are answered in advance.
+- **Have a SQL Server administrator reachable by phone** for the 45 minutes he is there.
+  Two of the top three failures need someone with rights we do not have.
+- **Ask him to run `preflight.bat` first, not `INSTALL.bat`.** It is the same checks
+  without Phase B onwards, it writes nothing to the cloud, and it takes two minutes. If
+  it passes, `INSTALL.bat` will get to Phase D. If it stops, he has lost two minutes
+  instead of ten and the queue has not moved. **This costs nothing and I would do it.**
+- **A Release zip built from `ship/`** — you have already ruled this out for this visit
+  and I agree. Customer #2.
+
+---
+
+## 3. What is most likely to go wrong, ranked
+
+The question you care about. Loud = he cannot miss it. Diagnosable = the transcript alone
+is enough for us to say what to do next, from here.
+
+| # | What | Likely | Loud? | Diagnosable? | Who can fix it on site |
+|---|---|---|---|---|---|
+| 1 | SQL instance/database name wrong | **High** | ✅ | ✅ | Him, if he has the name |
+| 2 | `monitor_ro` missing / wrong password / Mixed Mode off | **Medium-high** | ✅ | ✅ | **Nobody** — needs a SQL admin |
+| 3 | No `sync_state` row provisioned | Medium | ✅ | ✅ | **Nobody on site** — us, in seconds |
+| 4 | Read-only probe returns `INCONCLUSIVE` | Low-medium | ✅ | ✅ | **Nobody** — us, in minutes |
+| 5 | No ODBC driver on the machine | Low-medium | ✅ | ✅ | Him, with the installer |
+| 6 | Dry-run cross-check returns `ABORT` | Low | ✅ | ✅ | **Nobody — and it must not be** |
+| 7 | HTTPS to `*.supabase.co` blocked | Low | ✅ | ✅ | Whoever runs the network |
+| 8 | Phase E times out | Low | ✅ | ✅ | Us, remotely |
+
+### The three I would actually worry about
+
+**#1 — the SQL connection details.** This is the one the rehearsal hit, and it is the one
+most likely to happen. The stop is clean, names the file and the field, and the
+transcript carries the verbatim ODBC error including the SQLSTATE. **Nothing was written
+anywhere**, so he can fix the field and double-click again. It is entirely preventable
+by answering question 1(a).
+
+**#2 — `monitor_ro` cannot log in.** `Login failed for user 'monitor_ro'` is already
+mapped to its own instruction ("Wrong password, or SQL Server Mixed Mode auth is off.
+STOP. Call."). Loud and diagnosable — but **he cannot fix it and neither can we
+remotely.** It needs a SQL Server administrator on that machine. If this happens without
+one available, the visit fails and we go back. That is the trip-costing risk, and
+question 1(b) is what removes it.
+
+**#3 — the read-only probe returns `INCONCLUSIVE`.** The risk I own. My classifier
+recognises SQL Server permission errors by native code (`229`/`230`/`262`) with a message
+fallback. Those codes are stable across versions, and checking the *code* rather than the
+text means a localised SQL Server still classifies correctly — but I have never run this
+against a real SQL Server, and **an inconclusive answer deliberately stops the install.**
+
+It is worth being clear about what that means: **this can stop a perfectly good install.**
+I still think the rule is right — "we could not tell" and "it is refused" must never
+produce the same outcome — but it is a false-stop I can cause and you should expect it as
+a possible outcome rather than a surprise.
+
+The mitigation is that it is cheap to clear: the transcript prints the SQLSTATE, native
+number and full message **verbatim for every probe**, which is exactly what I need to fix
+the classifier. Turnaround is minutes, and he re-runs `preflight.bat --skip-install`
+rather than starting over.
+
+### One I want to name separately, because it is the dangerous kind
+
+**#6, `VERDICT: ABORT` on the dry-run cross-check.** Low probability, and if it happens
+**nobody should fix anything on site.** It means we are reading their data wrong, and
+every number after that point would be confidently incorrect. The correct outcome is that
+he photographs it, changes nothing, and we go home and think. The installer will not let
+him past it, which is the whole reason it exists.
+
+### What none of this covers
+
+Everything downstream of the first successful POS connection — the dry-run numbers, a
+real `LastTaskResult: 0`, the first shift report reconciling against
+**يومية الخزينة**. Those cannot be rehearsed from here and they are not in the table
+above because I have no basis for ranking them.
+
+---
+
+## Closing
+
+Priority Zero is enforced and proved on every install. The install is one click with
+every gate intact and a wait that proves the agent runs without a human. The logs are
+bounded, masked, and there is one file to send when something goes wrong.
+
+Five checks on this project turned out to share the fault they were meant to detect. The
+question that found the last two was cheap and I would use it again on anything: *what
+would this check still pass if it were broken?*
+
+Thank you for insisting on the empirical version of everything. The trigger finding, the
+closure test, and the fresh-clone rehearsal all came from you refusing to accept a
+verification that had not actually been run.
+
+Good luck at the shop.
+
+---
+
 # 2026-08-10 00:35 UTC — FINAL. Closing gate passed, pushed. Handover below.
 
 **311 passed** (was 209 at the start of this work), `test_golden.py` exactly **31**.
