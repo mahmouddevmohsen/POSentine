@@ -1,0 +1,30 @@
+# ── Secrets and machine-local state — never commit ──────────────
+config.json
+state.json
+*.lock
+.env
+.env.*
+*.token
+*.pem
+*.key
+
+# ── Customer data — real sales, employees, and cash counts ──────
+# Kept local on purpose. The GitHub Actions runner checks out this
+# repo; the customer's raw POS data must never land there.
+data UN/
+
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# ── Editors / OS ────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
