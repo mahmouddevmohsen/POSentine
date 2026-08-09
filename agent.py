@@ -304,6 +304,58 @@ def sql_raw_counts(cn, watermark_salid: int) -> tuple[int, int]:
     return invoices, lines
 
 
+def reconcile_with_cloud(client: supa.Supa, cfg: Config, state: State) -> bool:
+    """
+    Decide whether this is a genuine first install, using both sides.
+
+    Returns True when the agent should initialise (adopt MAX(salid) and read
+    nothing behind it), False when it must resume.
+
+    Keying "first run" on state.json alone is wrong in the way that actually
+    happens on site: an agent syncs to salid 1050, something looks off, the
+    folder is deleted and the install redone. With no local file it would
+    re-initialise to MAX(salid) and every invoice since 1050 would be
+    skipped — permanently, with a healthy heartbeat and a --confirm that
+    shows data landing. Deleting the folder and starting over is the first
+    thing anyone does when an install misbehaves.
+
+    The cloud is the authority; state.json is a cache. Initialising is
+    allowed exactly once, when nothing has ever synced on either side.
+    """
+    rows = client.select("sync_state", {
+        "tenant_id": f"eq.{cfg.tenant_id}",
+        "source_id": f"eq.{cfg.source_id}",
+        "select": "watermark_salid,rescan_from_salid"})
+    if not rows:
+        raise supa.SupaError(
+            "no sync_state row for this tenant/source. That is a "
+            "provisioning problem, not an empty history — refusing to treat "
+            "it as a first install, which would skip everything already synced."
+        )
+
+    cloud_wm = int(rows[0].get("watermark_salid") or 0)
+    cloud_rescan = int(rows[0].get("rescan_from_salid") or 0)
+    local_wm = state.watermark_salid
+
+    if cloud_wm == 0 and local_wm == 0 and not state.initialised:
+        return True
+
+    effective = max(cloud_wm, local_wm)
+    if cloud_wm != local_wm:
+        LOG.warning(
+            "watermark diverged: cloud=%d local=%d — resuming from the "
+            "higher (%d). A watermark is never moved backwards.",
+            cloud_wm, local_wm, effective)
+    if not state.initialised:
+        LOG.info("no local state but the cloud has synced to %d — resuming "
+                 "from there rather than re-initialising", cloud_wm)
+
+    state.initialised = True
+    state.watermark_salid = effective
+    state.rescan_from_salid = max(state.rescan_from_salid, cloud_rescan)
+    return False
+
+
 def _raw_counts(adapter, cn, watermark_salid: int) -> tuple[int, int]:
     return getattr(adapter, "raw_counts", sql_raw_counts)(cn, watermark_salid)
 
@@ -809,7 +861,12 @@ def run_once(cfg: Config, state: State, state_path: Path, adapter,
         # Without this, the first cycle pulls the entire history — on the
         # real database 218,207 invoices and 481,293 lines, during service.
         # There is no backfill by design; this is what that means.
-        if not state.initialised:
+        #
+        # Whether this IS a fresh install is decided against the cloud, not
+        # against state.json. A re-install with a deleted folder must resume,
+        # never re-initialise.
+        is_first_run = reconcile_with_cloud(client, cfg, state)
+        if is_first_run:
             top = _max_salid(adapter, cn)
             if dry_run:
                 _print_first_run(top)
@@ -957,11 +1014,11 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         state = State.load(args.state)
-        client = None
-        if not args.dry_run:
-            client = supa.Supa(cfg.supabase_url,
-                               anon_key=cfg.supabase_anon_key,
-                               token=cfg.supabase_agent_token)
+        # A dry run needs the client too: telling a first install from a
+        # re-install requires reading sync_state, and reading writes nothing.
+        client = supa.Supa(cfg.supabase_url,
+                           anon_key=cfg.supabase_anon_key,
+                           token=cfg.supabase_agent_token)
 
         # A dry run takes no lock: it writes nothing, so it cannot conflict
         # with the scheduled cycle, and it must never block one either.

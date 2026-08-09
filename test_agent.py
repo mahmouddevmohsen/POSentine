@@ -40,8 +40,11 @@ CFG = A.Config(
 class FakeSupa:
     """Records writes; can be told to fail on one table."""
 
-    def __init__(self, fail_on: str | None = None):
+    def __init__(self, fail_on: str | None = None, cloud_watermark: int = 0,
+                 sync_state_rows: list | None = None):
         self.fail_on = fail_on
+        self.cloud_watermark = cloud_watermark
+        self.sync_state_rows = sync_state_rows
         self.upserts: list[tuple[str, int]] = []
         self.updates: list[tuple[str, dict]] = []
         self.update_filters: list[tuple[str, dict]] = []
@@ -63,6 +66,14 @@ class FakeSupa:
     def insert(self, table, rows, returning=True):
         self.inserts.append((table, list(rows)))
         return []
+
+    def select(self, table, params=None, paginate=True):
+        if table != "sync_state":
+            return []
+        if self.sync_state_rows is not None:
+            return self.sync_state_rows
+        return [{"watermark_salid": self.cloud_watermark,
+                 "rescan_from_salid": self.cloud_watermark}]
 
     def tables_written(self):
         return {t for t, _ in self.upserts}
@@ -225,6 +236,9 @@ class StatefulSyncState:
     def insert(self, table, rows, returning=True):
         return []
 
+    def select(self, table, params=None, paginate=True):
+        return [dict(self.row)] if table == "sync_state" else []
+
     def update(self, table, filters, patch, returning=True):
         if table != "sync_state":
             return []
@@ -266,17 +280,22 @@ def test_watermark_write_is_guarded_against_going_backwards(paths):
 
 def test_a_hung_process_cannot_rewind_the_watermark(paths):
     """
-    The takeover case. A wedged cycle resumes after a newer one finished
-    and tries to write its own, older watermark. PostgreSQL must reject it
-    — a watermark moving backwards is the exact signature RestoreSuspected
-    exists to catch, and it must never fire for a benign reason.
+    The takeover case, tested at the write itself. A wedged cycle read the
+    cloud when it was at 1000, hung, and resumes after a newer cycle has
+    already reached 1104. Its PATCH carries the stale target. PostgreSQL
+    must reject it — a watermark moving backwards is the exact signature
+    RestoreSuspected exists to catch, and it must never fire for a benign
+    reason.
     """
     client = StatefulSyncState()
-    client.row.update({"watermark_salid": 5000, "watermark_saledeid": 90000})
+    client.row.update({"watermark_salid": 1104, "watermark_saledeid": 90129})
 
-    A.run_once(CFG, fresh_state(), paths, fake_adapter, client, NOW, False)
+    stale = A.build_cycle(fake_adapter, None, CFG, fresh_state(), NOW)
+    stale.watermark_target = 1050                  # what the hung cycle saw
 
-    assert client.row["watermark_salid"] == 5000, "the older write must not apply"
+    A.advance_sync_state(client, CFG, fresh_state(), stale, NOW)
+
+    assert client.row["watermark_salid"] == 1104, "the older write must not apply"
     assert client.rejected >= 1
 
 
@@ -561,6 +580,84 @@ def test_first_run_dry_run_reports_but_sets_nothing(paths, capsys):
     assert "1104" in out
     assert state.initialised is False and state.watermark_salid == 0
     assert not paths.exists()
+
+
+def test_a_reinstall_does_not_skip_the_gap(paths, caplog):
+    """
+    The scenario that actually happens at the shop. An agent runs and syncs
+    to salid 1050. Something looks wrong, the folder is deleted, the install
+    is redone. With first-run keyed only on state.json there is no local
+    state, so it would re-initialise to MAX(salid) and every invoice between
+    1050 and now would be skipped permanently — no error, healthy heartbeat,
+    --confirm shows data landing. The gap would be invisible forever.
+
+    The cloud is the authority; state.json is only a cache.
+    """
+    caplog.set_level("INFO")
+    client = FakeSupa(cloud_watermark=1050)
+    state = A.State()                       # folder deleted: nothing local
+
+    A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+
+    assert state.initialised is True
+    assert dict(client.upserts).get("invoices"), \
+        "a re-install must resume and read, not silently adopt MAX(salid)"
+    assert state.watermark_salid == 1104, "resumed from 1050 and read forward"
+    assert any("resum" in r.message.lower() or "cloud" in r.message.lower()
+               for r in caplog.records)
+
+
+def test_first_run_only_when_cloud_and_local_are_both_empty(paths):
+    """Initialising is allowed exactly once, when nothing has ever synced."""
+    client = FakeSupa(cloud_watermark=0)
+    state = A.State()
+    A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+    assert state.initialised is True
+    assert state.watermark_salid == 1104
+    assert client.upserts == [], "first run uploads nothing"
+
+
+def test_divergence_takes_the_higher_and_says_so(paths, caplog):
+    caplog.set_level("WARNING")
+    client = FakeSupa(cloud_watermark=1050)
+    state = A.State(initialised=True, watermark_salid=1000)   # local behind
+
+    A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+
+    assert state.watermark_salid == 1104
+    assert any("diverge" in r.message.lower() for r in caplog.records)
+
+
+def test_a_local_cache_ahead_of_the_cloud_wins(paths):
+    """Monotonic in both directions: never move a watermark backwards."""
+    client = FakeSupa(cloud_watermark=1000)
+    state = A.State(initialised=True, watermark_salid=1050)
+    A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+    assert state.watermark_salid >= 1050
+
+
+def test_an_unreadable_cloud_state_stops_the_cycle(paths):
+    """
+    If we cannot tell whether this is a first install or a re-install, the
+    two outcomes differ by a permanent silent gap. Refuse to guess.
+    """
+    class Unreadable(FakeSupa):
+        def select(self, table, params=None, paginate=True):
+            raise supa.SupaError("network down")
+
+    state = A.State()
+    assert A.run_once(CFG, state, paths, fake_adapter, Unreadable(), NOW,
+                      False) == A.EXIT_ERROR
+    assert state.initialised is False
+
+
+def test_a_missing_sync_state_row_is_not_treated_as_a_first_run(paths):
+    """No row means provisioning is wrong, not that nothing has synced."""
+    client = FakeSupa(sync_state_rows=[])
+    state = A.State()
+    assert A.run_once(CFG, state, paths, fake_adapter, client, NOW,
+                      False) == A.EXIT_ERROR
+    assert state.initialised is False
 
 
 def test_second_run_after_initialisation_pulls_normally(paths):
