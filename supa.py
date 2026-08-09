@@ -40,6 +40,10 @@ BACKOFF_CAP_SECONDS = 30.0
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
+# Only genuine transport failures are worth a second attempt. Everything
+# else raised from the request call is a bug in the caller.
+RETRYABLE_EXCEPTIONS = (requests.exceptions.RequestException, OSError)
+
 # Columns the server owns. A payload carrying one of these is a bug, and the
 # kind that surfaces late and looks like something else:
 #
@@ -149,12 +153,21 @@ class Supa:
                     data=data,
                     timeout=self.timeout,
                 )
-            except Exception as exc:                  # transport-level failure
+            except RETRYABLE_EXCEPTIONS as exc:        # transport-level hiccup
                 last = f"{type(exc).__name__}: {self._redact(str(exc))}"
                 if attempt == self.max_attempts:
                     break
                 self.sleep(self._backoff(attempt))
                 continue
+            except Exception as exc:
+                # Not a hiccup — a bug. A non-ASCII character in a token, a
+                # bad type, an unencodable header: none of these get better
+                # on a retry, and retrying buries the cause under "failed
+                # after 5 attempts" while someone waits through the backoff.
+                raise SupaError(
+                    f"{method} {table} failed and cannot be retried — "
+                    f"{type(exc).__name__}: {self._redact(str(exc))}"
+                ) from exc
 
             if 200 <= resp.status_code < 300:
                 return resp
@@ -227,6 +240,29 @@ class Supa:
             if len(chunk) < self.page:
                 return out
             offset += self.page
+
+    def count(self, table: str,
+              params: Mapping[str, str] | None = None) -> int:
+        """
+        Row count from the Content-Range header, without dragging the rows
+        across the wire. PostgREST answers '*' when it did not compute a
+        total; reporting that as 0 would be a confident lie, so it raises.
+        """
+        resp = self._request(
+            "GET", table,
+            headers={"Prefer": "count=exact", "Range-Unit": "items",
+                     "Range": "0-0"},
+            params=params,
+        )
+        content_range = (getattr(resp, "headers", {}) or {}).get("Content-Range", "")
+        total = content_range.rsplit("/", 1)[-1].strip()
+        if not total or total == "*":
+            raise SupaError(
+                f"count({table}): PostgREST returned no total "
+                f"(Content-Range {content_range!r}) — refusing to report a "
+                "number we do not have"
+            )
+        return int(total)
 
     # ── writes ──────────────────────────────────────────────────
 

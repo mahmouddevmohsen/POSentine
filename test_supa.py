@@ -181,6 +181,31 @@ def test_429_honours_retry_after():
     assert clock.slept == [7.0]
 
 
+def test_a_programming_error_is_not_retried_five_times():
+    """
+    A non-ASCII character in a token raises UnicodeEncodeError when the
+    header is built. That can never succeed on a retry, and retrying buries
+    the real cause under 'failed after 5 attempts' while the operator waits
+    through the backoff.
+    """
+    client, session, clock = make([UnicodeEncodeError("latin-1", "x", 0, 1, "bad")])
+    with pytest.raises(supa.SupaError) as exc:
+        client.select("invoices")
+    assert len(session.calls) == 1, "must fail on the first attempt"
+    assert clock.slept == []
+    assert "UnicodeEncodeError" in str(exc.value)
+
+
+def test_a_transport_hiccup_is_still_retried():
+    import requests as _rq
+    client, session, _ = make([
+        _rq.exceptions.ConnectionError("reset"),
+        FakeResponse(200, rows(2)),
+    ])
+    assert len(client.select("invoices")) == 2
+    assert len(session.calls) == 2
+
+
 def test_other_4xx_is_not_retried():
     """A 403 from RLS is an answer, not a hiccup. Retrying hides it."""
     client, session, _ = make([FakeResponse(403, text="permission denied")])
@@ -245,6 +270,32 @@ def test_upsert_of_nothing_makes_no_request():
     client, session, _ = make([])
     assert client.upsert("invoices", [], on_conflict="salid") == 0
     assert session.calls == []
+
+
+# ════════════════════════════════════════════════════════════════
+# 4b) counting without dragging the rows across the wire
+# ════════════════════════════════════════════════════════════════
+
+def test_count_reads_the_total_from_content_range():
+    client, session, _ = make([
+        FakeResponse(206, [{"id": 1}], headers={"Content-Range": "0-0/1500"}),
+    ])
+    assert client.count("invoices") == 1500
+    h = session.calls[0]["headers"]
+    assert "count=exact" in h["Prefer"]
+    assert h["Range"] == "0-0", "must not fetch the rows to count them"
+
+
+def test_count_of_empty_table_is_zero():
+    client, _, _ = make([FakeResponse(206, [], headers={"Content-Range": "*/0"})])
+    assert client.count("invoices") == 0
+
+
+def test_count_raises_when_the_total_is_unknown():
+    """'*' means PostgREST did not compute a total. Reporting 0 would be a lie."""
+    client, _, _ = make([FakeResponse(206, [], headers={"Content-Range": "0-0/*"})])
+    with pytest.raises(supa.SupaError):
+        client.count("invoices")
 
 
 # ════════════════════════════════════════════════════════════════

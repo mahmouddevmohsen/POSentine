@@ -43,6 +43,7 @@ class FakeSupa:
         self.fail_on = fail_on
         self.upserts: list[tuple[str, int]] = []
         self.updates: list[tuple[str, dict]] = []
+        self.update_filters: list[tuple[str, dict]] = []
         self.inserts: list[tuple[str, list]] = []
 
     def upsert(self, table, rows, on_conflict):
@@ -55,7 +56,8 @@ class FakeSupa:
         if table == self.fail_on:
             raise supa.SupaError(f"{table} failed")
         self.updates.append((table, patch))
-        return []
+        self.update_filters.append((table, dict(filters)))
+        return [patch]
 
     def insert(self, table, rows, returning=True):
         self.inserts.append((table, list(rows)))
@@ -149,12 +151,30 @@ def test_failure_still_records_a_heartbeat(paths):
 # 3) 🔴 last_rescan_at is the deletion trigger — never on a partial upload
 # ════════════════════════════════════════════════════════════════
 
+def _merged_patches(client) -> dict:
+    """sync_state is written as several independently-guarded PATCHes."""
+    merged = {}
+    for table, patch in client.updates:
+        if table == "sync_state":
+            merged.update(patch)
+    return merged
+
+
 def test_rescan_cycle_stamps_last_rescan_at(paths):
     client, state = FakeSupa(), fresh_state()      # cycle_index 0 -> rescan
     A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
-    patch = dict(client.updates[0][1])
+    patch = _merged_patches(client)
     assert patch["last_rescan_at"] == "2026-08-09T03:00:00+00:00"
     assert patch["rescan_from_salid"] == 1000
+
+
+def test_last_rescan_write_is_guarded_by_lt_or_null(paths):
+    client, state = FakeSupa(), fresh_state()
+    A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+    guards = [f for t, f in client.update_filters if t == "sync_state"]
+    rescan_guard = [g for g in guards if "last_rescan_at" in g.get("or", "")]
+    assert rescan_guard, "the rescan stamp must be written monotonically"
+    assert "lt." in rescan_guard[0]["or"] and "is.null" in rescan_guard[0]["or"]
 
 
 def test_non_rescan_cycle_never_touches_last_rescan_at(paths):
@@ -163,7 +183,7 @@ def test_non_rescan_cycle_never_touches_last_rescan_at(paths):
     state.products = {i: {"itname": n, "list_price": p}
                       for i, n, p in fake_adapter.MENU}
     A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
-    patch = dict(client.updates[0][1])
+    patch = _merged_patches(client)
     assert "last_rescan_at" not in patch
     assert "rescan_from_salid" not in patch
 
@@ -178,6 +198,101 @@ def test_partial_rescan_upload_does_not_stamp_last_rescan_at(paths):
     A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
     assert client.updates == []
     assert state.rescan_from_salid == 0
+
+
+# ════════════════════════════════════════════════════════════════
+# 3b) 🔴 sync_state must be monotonic — upserts do not protect it
+# ════════════════════════════════════════════════════════════════
+
+class StatefulSyncState:
+    """
+    A sync_state row that actually enforces PostgREST filters, so the
+    monotonicity can be tested as a property rather than as a string in a
+    request. Only the filters the agent uses are implemented.
+    """
+
+    def __init__(self):
+        self.row = {"watermark_salid": 0, "watermark_saledeid": 0,
+                    "rescan_from_salid": 0, "last_sync_at": None,
+                    "last_rescan_at": None, "pos_max_salid": 0}
+        self.rejected = 0
+
+    def upsert(self, table, rows, on_conflict):
+        return len(rows)
+
+    def insert(self, table, rows, returning=True):
+        return []
+
+    def update(self, table, filters, patch, returning=True):
+        if table != "sync_state":
+            return []
+        if not self._matches(filters):
+            self.rejected += 1
+            return []                      # PostgREST: zero rows matched
+        self.row.update(patch)
+        return [dict(self.row)]
+
+    def _matches(self, filters) -> bool:
+        for key, expr in filters.items():
+            if key in ("tenant_id", "source_id"):
+                continue
+            if key == "or":
+                inner = expr.strip("()").split(",")
+                if not any(self._one(c) for c in inner):
+                    return False
+            elif not self._one(f"{key}.{expr}"):
+                return False
+        return True
+
+    def _one(self, clause: str) -> bool:
+        col, op, val = clause.split(".", 2)
+        current = self.row.get(col)
+        if op == "is" and val == "null":
+            return current is None
+        if op == "lt":
+            if current is None:
+                return False
+            return str(current) < val if isinstance(current, str) else current < int(val)
+        raise AssertionError(f"unsupported filter in test: {clause}")
+
+
+def test_watermark_write_is_guarded_against_going_backwards(paths):
+    client, state = StatefulSyncState(), fresh_state()
+    A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+    assert client.row["watermark_salid"] == 1104
+
+
+def test_a_hung_process_cannot_rewind_the_watermark(paths):
+    """
+    The takeover case. A wedged cycle resumes after a newer one finished
+    and tries to write its own, older watermark. PostgreSQL must reject it
+    — a watermark moving backwards is the exact signature RestoreSuspected
+    exists to catch, and it must never fire for a benign reason.
+    """
+    client = StatefulSyncState()
+    client.row.update({"watermark_salid": 5000, "watermark_saledeid": 90000})
+
+    A.run_once(CFG, fresh_state(), paths, fake_adapter, client, NOW, False)
+
+    assert client.row["watermark_salid"] == 5000, "the older write must not apply"
+    assert client.rejected >= 1
+
+
+def test_an_older_rescan_stamp_cannot_overwrite_a_newer_one(paths):
+    client = StatefulSyncState()
+    client.row["last_rescan_at"] = "2026-08-09T04:00:00+00:00"   # newer
+
+    A.run_once(CFG, fresh_state(), paths, fake_adapter, client,
+               dt.datetime(2026, 8, 9, 3, 0, tzinfo=dt.timezone.utc), False)
+
+    assert client.row["last_rescan_at"] == "2026-08-09T04:00:00+00:00"
+
+
+def test_first_ever_rescan_applies_when_last_rescan_at_is_null(paths):
+    client = StatefulSyncState()
+    assert client.row["last_rescan_at"] is None
+    A.run_once(CFG, fresh_state(), paths, fake_adapter, client, NOW, False)
+    assert client.row["last_rescan_at"] == "2026-08-09T03:00:00+00:00"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -293,8 +408,84 @@ def test_a_hung_holder_is_taken_over_rather_than_stalling_forever(tmp_path):
 
 
 # ════════════════════════════════════════════════════════════════
+# 7b) --confirm reads the cloud back and judges it on this screen
+# ════════════════════════════════════════════════════════════════
+
+class ReadbackSupa:
+    def __init__(self, counts=None, state=None, beats=None):
+        self.counts = counts or {"invoices": 45, "invoice_lines": 129,
+                                 "cash_counts": 2, "pos_products": 9,
+                                 "pos_users": 1}
+        self.null_price = 0
+        self.state = state if state is not None else [{
+            "watermark_salid": 1104, "last_sync_at": "2026-08-09T03:00:00+00:00",
+            "last_rescan_at": "2026-08-09T03:00:00+00:00",
+            "restore_suspected": False, "schema_ok": True}]
+        self.beats = beats if beats is not None else [
+            {"at": "2026-08-09T03:00:00+00:00", "ok": True, "drift_seconds": -3,
+             "rows_pulled": 174, "note": None}]
+
+    def count(self, table, params=None):
+        if (params or {}).get("list_price") == "is.null":
+            return self.null_price
+        return self.counts[table]
+
+    def select(self, table, params=None, paginate=True):
+        return self.state if table == "sync_state" else self.beats
+
+
+def test_confirm_passes_on_a_healthy_upload(capsys):
+    assert A.confirm(ReadbackSupa(), CFG) == A.EXIT_OK
+    out = capsys.readouterr().out
+    assert "RESULT: OK" in out and "watermark_salid      1104" in out
+
+
+def test_confirm_flags_lines_without_a_price(capsys):
+    client = ReadbackSupa()
+    client.null_price = 3
+    assert A.confirm(client, CFG) == A.EXIT_ERROR
+    assert "Zero-invoice detection" in capsys.readouterr().out
+
+
+def test_confirm_flags_a_halted_sync(capsys):
+    client = ReadbackSupa(state=[{"watermark_salid": 0, "restore_suspected": True,
+                                  "schema_ok": True, "last_rescan_at": None}])
+    assert A.confirm(client, CFG) == A.EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "restore_suspected is true" in out
+
+
+def test_confirm_flags_silence(capsys):
+    """No heartbeats and no data must never read as a clean install."""
+    client = ReadbackSupa(beats=[])
+    client.counts = dict(client.counts, invoices=0)
+    assert A.confirm(client, CFG) == A.EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "no heartbeats at all" in out and "no invoices landed" in out
+
+
+# ════════════════════════════════════════════════════════════════
 # 8) config
 # ════════════════════════════════════════════════════════════════
+
+def test_config_rejects_unfilled_placeholders(tmp_path):
+    """
+    config.example.json ships '<from mint_agent_token.py>'. Copied over
+    unedited, that reaches the HTTP layer and dies as UnicodeEncodeError on
+    an em-dash — an error that points at encoding, not at the config nobody
+    filled in. Name the real problem instead.
+    """
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({
+        "tenant_id": "t", "source_id": "s", "supabase_url": "https://x",
+        "supabase_anon_key": "real-anon",
+        "supabase_agent_token": "<from mint_agent_token.py>",
+        "sql": {"server": "x"}}), encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        A.Config.load(p)
+    assert "supabase_agent_token" in str(exc.value)
+    assert "placeholder" in str(exc.value).lower()
+
 
 def test_config_rejects_a_missing_anon_key(tmp_path):
     p = tmp_path / "config.json"

@@ -109,11 +109,23 @@ class Config:
     @staticmethod
     def load(path: Path) -> "Config":
         raw = json.loads(path.read_text(encoding="utf-8"))
-        missing = [k for k in ("tenant_id", "source_id", "supabase_url",
-                               "supabase_anon_key", "supabase_agent_token", "sql")
-                   if not raw.get(k)]
+        required = ("tenant_id", "source_id", "supabase_url",
+                    "supabase_anon_key", "supabase_agent_token", "sql")
+        missing = [k for k in required if not raw.get(k)]
         if missing:
             raise ValueError(f"config is missing required keys: {missing}")
+
+        # config.example.json ships angle-bracket placeholders. Copied over
+        # unedited they reach the HTTP layer and die as UnicodeEncodeError
+        # on an em-dash — an error that points at encoding rather than at
+        # the field nobody filled in.
+        placeholders = [k for k in required
+                        if isinstance(raw[k], str) and raw[k].startswith("<")]
+        if placeholders:
+            raise ValueError(
+                f"config still has unfilled placeholder values: {placeholders} "
+                "— replace them with real values before running the agent"
+            )
         return Config(
             tenant_id=raw["tenant_id"],
             source_id=raw["source_id"],
@@ -365,26 +377,53 @@ def upload(client: supa.Supa, cfg: Config, result: CycleResult) -> None:
 
 def advance_sync_state(client: supa.Supa, cfg: Config, state: State,
                        result: CycleResult, stamp: _dt.datetime) -> None:
-    """Called only after `upload` returned without raising."""
+    """
+    Called only after `upload` returned without raising.
+
+    Every write here is monotonic, enforced by the database rather than by
+    ordering. Row data is protected by idempotent upserts, but sync_state
+    is not: if the lock's stale-takeover ever lets a hung cycle resume
+    behind a newer one, it would write its own older watermark over the
+    newer one. Nothing would be lost — the next cycle re-pulls — but a
+    watermark moving backwards is precisely the signature RestoreSuspected
+    exists to detect, and it must never fire for a benign reason.
+
+    A `lt` filter means the UPDATE matches zero rows when the stored value
+    is already ahead. Safe under any interleaving, no locking needed.
+    """
     pulled = result.pull
-    patch: dict[str, Any] = {
-        "watermark_salid": pulled.max_salid,
-        "watermark_saledeid": pulled.max_saledeid,
-        "pos_max_salid": pulled.max_salid,
-        "last_sync_at": R.utc_ts(stamp),
-    }
+    base = {"tenant_id": f"eq.{cfg.tenant_id}", "source_id": f"eq.{cfg.source_id}"}
+    now = R.utc_ts(stamp)
+
+    applied = client.update(
+        "sync_state",
+        {**base, "watermark_salid": f"lt.{pulled.max_salid}"},
+        {"watermark_salid": pulled.max_salid,
+         "watermark_saledeid": pulled.max_saledeid,
+         "pos_max_salid": pulled.max_salid,
+         "last_sync_at": now},
+    )
+    if not applied:
+        LOG.info("watermark already at or beyond %d — a newer cycle got there "
+                 "first; leaving it alone", pulled.max_salid)
+
+    # last_sync_at must move even on a cycle that found no new invoices,
+    # otherwise a quiet shop looks identical to a stalled agent.
+    client.update(
+        "sync_state",
+        {**base, "or": f"(last_sync_at.lt.{now},last_sync_at.is.null)"},
+        {"last_sync_at": now}, returning=False)
+
     if result.did_rescan:
         # Every invoice in the window carries last_seen_at = stamp, so the
-        # orchestrator can read absence as "not refreshed by this rescan".
-        # If any batch above had failed we would not be here, and the old
+        # orchestrator reads absence as "not refreshed by this rescan". If
+        # any batch above had failed we would not be here, and the older
         # last_rescan_at would keep the cloud from inferring deletions.
-        patch["rescan_from_salid"] = pulled.window_from_salid
-        patch["last_rescan_at"] = R.utc_ts(stamp)
-
-    client.update("sync_state",
-                  {"tenant_id": f"eq.{cfg.tenant_id}",
-                   "source_id": f"eq.{cfg.source_id}"},
-                  patch, returning=False)
+        client.update(
+            "sync_state",
+            {**base, "or": f"(last_rescan_at.lt.{now},last_rescan_at.is.null)"},
+            {"rescan_from_salid": pulled.window_from_salid,
+             "last_rescan_at": now}, returning=False)
 
 
 def send_heartbeats(client: supa.Supa, cfg: Config, result: CycleResult,
@@ -465,6 +504,90 @@ def print_dry_run(result: CycleResult, state: State, driver: str,
       "back on purpose (NOLOCK can read a")
     w("  write that later rolls back), so a small excess is correct.")
     w("=" * 62)
+
+
+# ════════════════════════════════════════════════════════════════
+# confirmation — read back what landed, on this screen
+# ════════════════════════════════════════════════════════════════
+
+def confirm(client: supa.Supa, cfg: Config, out=None) -> int:
+    """
+    Reads the cloud back and prints a verdict here, so nobody has to open
+    a browser on a second device while standing at a counter.
+
+    Read-only. Uses the agent's own token, so it also proves the token that
+    ships is the one that works.
+    """
+    out = out or sys.stdout
+    scope = {"tenant_id": f"eq.{cfg.tenant_id}", "source_id": f"eq.{cfg.source_id}"}
+    problems: list[str] = []
+
+    def w(text: str = "") -> None:
+        print(text, file=out)
+
+    counts = {name: client.count(name, scope) for name in
+              ("invoices", "invoice_lines", "cash_counts",
+               "pos_products", "pos_users")}
+    null_price = client.count("invoice_lines", {**scope, "list_price": "is.null"})
+    state_rows = client.select("sync_state", {**scope, "select": "*"})
+    beats = client.select("heartbeats", {
+        **scope, "select": "at,ok,drift_seconds,rows_pulled,note",
+        "order": "at.desc", "limit": "5"}, paginate=False)
+
+    w("=" * 62)
+    w("POSentine — what actually landed in the cloud")
+    w("=" * 62)
+    for name, n in counts.items():
+        w(f"  {name:<20} {n}")
+    w(f"  {'lines w/o price':<20} {null_price}")
+    w("")
+
+    if not state_rows:
+        problems.append("no sync_state row for this tenant/source")
+    else:
+        st = state_rows[0]
+        w(f"  watermark_salid      {st.get('watermark_salid')}")
+        w(f"  last_sync_at         {st.get('last_sync_at')}")
+        w(f"  last_rescan_at       {st.get('last_rescan_at')}")
+        w(f"  restore_suspected    {st.get('restore_suspected')}")
+        w(f"  schema_ok            {st.get('schema_ok')}")
+        if st.get("restore_suspected"):
+            problems.append("restore_suspected is true — syncing is halted")
+        if not st.get("schema_ok", True):
+            problems.append("schema_ok is false — HD Soft changed a column")
+        if not st.get("last_rescan_at"):
+            problems.append("last_rescan_at is null — no rescan has completed, "
+                            "so deletions cannot be detected yet")
+        if not counts["invoices"]:
+            problems.append("no invoices landed at all")
+
+    w("")
+    w("  recent heartbeats")
+    for b in beats:
+        flag = "ok " if b.get("ok") else "ERR"
+        note = (b.get("note") or "")[:70]
+        w(f"    {flag} {b.get('at')}  drift={b.get('drift_seconds')}  "
+          f"rows={b.get('rows_pulled')}  {note}")
+    if not beats:
+        problems.append("no heartbeats at all — nothing has reported in")
+    elif not beats[0].get("ok"):
+        problems.append("the most recent heartbeat is not ok — read its note")
+
+    if null_price:
+        problems.append(
+            f"{null_price} line(s) have no list_price. Zero-invoice detection "
+            "cannot see them. Send us the unknown_item notes above.")
+
+    w("")
+    if problems:
+        w("  RESULT: NEEDS ATTENTION")
+        for p in problems:
+            w(f"    ✗ {p}")
+        w("=" * 62)
+        return EXIT_ERROR
+    w("  RESULT: OK — data landed, watermark advanced, agent reporting in")
+    w("=" * 62)
+    return EXIT_OK
 
 
 # ════════════════════════════════════════════════════════════════
@@ -583,6 +706,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--log", default=None, type=Path)
     ap.add_argument("--dry-run", action="store_true",
                     help="read and print; write nothing, anywhere")
+    ap.add_argument("--confirm", action="store_true",
+                    help="read the cloud back and print a verdict; writes nothing")
     ap.add_argument("--fake", action="store_true",
                     help="use the fixture adapter instead of SQL Server")
     ap.add_argument("--loop", action="store_true",
@@ -601,6 +726,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.fake:
         import fake_adapter
         adapter = fake_adapter
+
+    if args.confirm:
+        client = supa.Supa(cfg.supabase_url, anon_key=cfg.supabase_anon_key,
+                           token=cfg.supabase_agent_token)
+        try:
+            return confirm(client, cfg)
+        except supa.SupaError as exc:
+            LOG.error("could not read the cloud back: %s", exc)
+            return EXIT_ERROR
 
     while True:
         state = State.load(args.state)

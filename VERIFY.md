@@ -1,188 +1,225 @@
-# VERIFY — on-site acceptance for the POSentine agent
+# VERIFY — POSentine install and acceptance, one visit
 
-For whoever is standing at the shop. Work top to bottom. **Every step has an
-expected result; if what you see does not match, stop at that step** and use the
-"if it does not match" note. Do not continue past a mismatch — the whole point of
-this product is that wrong numbers are worse than no numbers.
+You are standing at the counter. There is a queue. Work down the list.
 
-Total time if nothing goes wrong: about 15 minutes.
+**Every step has an expected result printed next to it. If what you see does not
+match, STOP at that step.** Do not adjust anything to make it match. A wrong number
+that gets believed is worse than no number.
+
+Steps 1–4 write nothing to the POS or the cloud. The first write is step 5.
+**Nothing in this product ever writes to the POS database — not one statement.**
+
+Time if nothing goes wrong: ~20 minutes. Budget 45.
 
 ---
 
-## 0 — Before you start
-
-On the POS machine, in `C:\thirdeyev`:
+## 1 — Console and Python
 
 ```powershell
+cd C:\thirdeyev
 chcp 65001
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
+python --version
 ```
 
-**Why:** the reports are Arabic. A default Windows console is cp1252 and will mangle
-or crash on them. `chcp 65001` makes the output readable. The agent forces UTF-8 on
-its own streams too, so it will not crash without this — but you will not be able to
-read what it prints.
+**Expect:** `Active code page: 65001`, then `Python 3.11.x` or `3.12.x`.
 
-Confirm you have `config.json` (not `config.example.json`) and that it contains a
-`supabase_agent_token`, **not** a service_role key. A service_role key on this machine
-is a stop-everything problem, not a configuration detail.
+> `chcp 65001` is so you can *read* the Arabic. The agent forces UTF-8 on its own
+> output and will not crash without it, but the screen will be unreadable.
 
-```powershell
-python -c "import json;c=json.load(open('config.json'));print('role in token:', 'service_role' in c['supabase_agent_token'])"
-```
-
-**Expected:** `role in token: False`
-**If it does not match:** stop. Do not run the agent. Call before doing anything else.
+**STOP IF:** Python is missing or below 3.11.
 
 ---
 
-## 1 — The tests still pass here
+## 2 — Dependencies
 
 ```powershell
+python -m pip install -r requirements.txt
+python -c "import pyodbc; print('pyodbc', pyodbc.version); print(pyodbc.drivers())"
+```
+
+**Expect:** a version number, then a list containing an `ODBC Driver ... for SQL Server`.
+
+> `pyodbc` is the one dependency never exercised on this machine. It ships as a wheel
+> and should not need to compile.
+
+**STOP IF:** the install tries to compile and fails → install "Microsoft ODBC Driver 17
+for SQL Server", then retry.
+**STOP IF:** the driver list is `[]` → no ODBC driver. Install Driver 17. The agent
+cannot connect without one.
+
+---
+
+## 3 — Config
+
+Place `config.json` in `C:\thirdeyev`. Copy it from `config.example.json` and fill in.
+**Never** paste a token into a terminal and never commit this file.
+
+```powershell
+python -c "import json;c=json.load(open('config.json'));print('keys ok:', all(c.get(k) for k in ['tenant_id','source_id','supabase_url','supabase_anon_key','supabase_agent_token']));print('service_role present:', 'service_role' in c['supabase_agent_token'])"
 python -m pytest -q test_golden.py
 ```
 
-**Expected:** `31 passed`
-**If it does not match:** stop. The machine has a different copy of the code than we
-verified. Do not proceed.
+**Expect:**
+```
+keys ok: True
+service_role present: False
+31 passed
+```
+
+**STOP IF:** `service_role present: True` → that key bypasses every access rule and must
+never exist on this machine. Do not run the agent. Call.
+**STOP IF:** not `31 passed` → this machine has different code than we verified.
 
 ---
 
-## 2 — Dry run: what would be read
+## 4 — Dry run (reads only, writes nothing anywhere)
 
 ```powershell
 python agent.py --dry-run
 ```
 
-**Expected:** a block headed `DRY RUN (nothing is written, anywhere)` showing the ODBC
-driver, `schema check OK`, the watermark, counts, the `sold_at` range, and a kind
-breakdown.
+**Expect:** a block headed `DRY RUN (nothing is written, anywhere)`.
 
-Write down these two numbers:
+**Write these down:**
 
-- `watermark_salid` = ________
-- `invoices to upload` = ________
+| | |
+|---|---|
+| `watermark_salid` | ____________ |
+| `invoices to upload` | ____________ |
+| `sold_at range` | ____________ → ____________ |
+| kinds: cash / external / return / other | ____ / ____ / ____ / ____ |
 
-**This step writes nothing** — no heartbeat, no watermark, no state file. Running it
-twice is safe, and running it while the scheduled task is running is safe.
+**Sanity:** the `sold_at range` should sit inside the period the shop was actually open,
+and `cash` should be the large majority. If `other` is not 0, note the number.
 
-### If it does not match
-
-| What you see | What it means | Do |
+| If you see | Meaning | Do |
 |---|---|---|
-| `مفيش ODBC driver مناسب` | No SQL Server ODBC driver installed | Install "ODBC Driver 17 for SQL Server", retry |
-| `Login failed for user 'monitor_ro'` | Wrong password, or Mixed Mode auth is off | Stop; call |
-| `أعمدة ناقصة بعد تحديث محتمل لـHD Soft` | HD Soft was updated and a column we rely on changed | **Stop. Do not proceed.** Send the full message |
-| `restore suspected` | The database was restored from a backup; `salid` moved backwards | **Stop. Do not proceed.** Manual review required |
-| `⚠ items missing from the snapshot` | New menu items we have not seen | Not a blocker — note the IDs and continue |
+| `مفيش ODBC driver مناسب` | No driver | Back to step 2 |
+| `Login failed for user 'monitor_ro'` | Wrong password, or Mixed Mode auth off | **STOP. Call.** |
+| `أعمدة ناقصة بعد تحديث` | HD Soft updated, a column we rely on changed | **STOP. Call.** |
+| `restore suspected` | Database restored from backup; `salid` went backwards | **STOP. Call.** |
+| `⚠ items missing from the snapshot` | New menu items | Note the IDs, continue |
 
 ---
 
-## 3 — Compare against the POS itself
+## 5 — 🔴 The comparison. This is the acceptance check.
 
-This is the acceptance check. In SQL Server Management Studio, or `sqlcmd`, run —
-substituting the watermark you wrote down:
+In SSMS or `sqlcmd`, using the `watermark_salid` from step 4:
 
 ```sql
 SELECT COUNT(*) FROM Sales WITH (NOLOCK) WHERE salid > <watermark_salid>;
 ```
 
-**Expected:** a number **greater than or equal to** `invoices to upload`, and larger by
-at most a handful.
+**Expect:** `SQL count − invoices to upload` = **0 to 5**, and never negative.
 
-**Why not exactly equal:** the agent deliberately ignores invoices created in the last
-30 seconds. `NOLOCK` can read a row that is still being written and later rolled back,
-which would otherwise produce a "deleted invoice" alert for a receipt that never
-existed. A busy shop will show a difference of one or two. A quiet one, zero.
+**The only acceptable difference is invoices created in the last 30 seconds.** The agent
+holds those back on purpose: `NOLOCK` can read a row still being written that is later
+rolled back, which would otherwise raise a "deleted invoice" alert for a receipt that
+never existed. A busy counter shows 1–3. A quiet one shows 0.
 
-**If the difference is large** (more than about five, or the agent's number is higher):
-stop and call. That is not a timing artefact.
+### 🛑 ABORT CRITERIA — any of these, stop the visit
+
+- The difference is **negative** (the agent claims more invoices than the POS has)
+- The difference is **more than 5**
+- The SQL query errors
+
+**Then:** photograph both outputs — the full dry-run block and the SQL result.
+**Change nothing. Install nothing. Call.**
+
+A mismatch here means we are reading their data wrong, and every number after this point
+would be confidently incorrect.
 
 ---
 
-## 4 — One real cycle
+## 6 — One real cycle, then confirm it
 
 ```powershell
 python agent.py
 ```
 
-**Expected:** `cycle ok — N invoices, M lines, watermark now <number>`, exit code 0.
+**Expect:** `cycle ok — N invoices, M lines, watermark now <number>` and nothing after it.
 
-Then in Supabase → SQL Editor:
-
-```sql
-select
-  (select count(*) from invoices)                                    as invoices,
-  (select count(*) from invoice_lines)                               as lines,
-  (select count(*) from invoice_lines where list_price is null)      as lines_missing_price,
-  (select count(*) from cash_counts)                                 as cash_counts,
-  (select count(*) from pos_products)                                as products,
-  (select watermark_salid from sync_state limit 1)                   as watermark,
-  (select last_rescan_at   from sync_state limit 1)                  as last_rescan_at;
-
-select at, ok, agent_version, drift_seconds, rows_pulled, note
-from heartbeats order by at desc limit 10;
+```powershell
+python agent.py --confirm
 ```
 
-**Expected:**
+**Expect:** the last line is
 
-- `invoices` and `lines` match what the dry run said it would upload
-- `watermark` equals the POS `MAX(salid)`
-- `last_rescan_at` is not null (the first cycle is always a rescan)
-- the newest heartbeat has `ok = true` and `note = null`
-- `drift_seconds` is within ±300
+```
+  RESULT: OK — data landed, watermark advanced, agent reporting in
+```
 
-**If `lines_missing_price` is greater than 0:** the snapshot is missing menu items.
-Zero-invoice detection cannot see those lines. Look for `note` rows with
-`"kind": "unknown_item"` and send us the item IDs. Not a stop, but tell us.
+and in the block above it:
 
-**If `drift_seconds` is beyond ±300:** the POS clock is wrong. Every shift boundary
-depends on it. Fix the machine clock before go-live.
+- `invoices` and `invoice_lines` match step 4's numbers
+- `lines w/o price` is `0`
+- `watermark_salid` matches the POS `MAX(salid)`
+- `last_rescan_at` is **not** null
+- the newest heartbeat starts `ok ` with `drift=` within ±300
 
-**If a heartbeat has `ok = false`:** read its `note` — it is JSON and names the problem.
-`restore_suspected` and `schema_drift` are stop-and-call.
+> `--confirm` reads the cloud back with the agent's own token and prints the verdict
+> here. No browser, no second device. It also proves the token that ships is the token
+> that works.
+
+**If `RESULT: NEEDS ATTENTION`,** it lists exactly what is wrong. Common cases:
+
+| Line | Meaning | Do |
+|---|---|---|
+| `lines w/o price` > 0 | New menu items we have never seen; zero-invoice detection is blind to them | Not a stop. Send us the `unknown_item` notes |
+| `drift` beyond ±300 | The POS clock is wrong; every shift boundary depends on it | Fix the machine clock, re-run step 6 |
+| `restore_suspected is true` | `salid` went backwards | **STOP. Call.** |
+| `no invoices landed at all` | Upload failed silently upstream | **STOP. Call.** |
 
 ---
 
-## 5 — Let it run, then check a real shift
-
-Install the scheduled task and leave it for one full shift.
+## 7 — Install the scheduled task
 
 ```powershell
+.\install\install_agent.ps1
 Get-ScheduledTask -TaskName thirdeyev | Get-ScheduledTaskInfo
 ```
 
-**Expected:** `LastTaskResult` is `0`, and `LastRunTime` is within the last 3 minutes.
+**Expect:** `LastTaskResult : 0`.
 
-After a shift boundary (07:00 or 19:00), open HD Soft's **يومية الخزينة** screen for
-that shift and compare against:
+Wait three minutes, then:
 
-```sql
-select shift_date, shift_name, sales, returns, delivery, collections, grand_total
-from shift_reports order by shift_date desc, shift_name desc limit 4;
+```powershell
+Get-ScheduledTask -TaskName thirdeyev | Get-ScheduledTaskInfo
+python agent.py --confirm
 ```
 
-**Expected:** `grand_total` equals the total on their screen, exactly.
+**Expect:** `LastRunTime` inside the last 3 minutes, `LastTaskResult : 0`, and a **newer**
+heartbeat than the one you saw in step 6.
 
-The formula is `sales + collections − returns − delivery`. If any single line differs,
-stop and send us the screen and the row. **Do not adjust anything to make them match.**
+**STOP IF:** `LastTaskResult` is not 0, or no new heartbeat appeared. The task is
+registered but not running, and nothing will arrive after you leave.
 
 ---
 
-## 6 — Go-live: enabling notifications
+## 8 — Before you leave
 
-⚠️ **These two changes must happen in the same statement.** Not the same session — the
-same statement.
+```powershell
+Get-Content C:\thirdeyev\agent.log -Tail 20
+```
 
-During the silent period the system detects events and stores them with
-`notify = false`. Nothing is sent. But `filter_sendable` suppresses an event only when
-it is older than `go_live_at`, and `go_live_at` is null until now. The moment
-`notify` becomes true with `go_live_at` still null, **every event accumulated since
-installation becomes sendable at once** — and the owner's first-ever contact from this
-system would be dozens of alerts about things that happened last week.
+**Expect:** `cycle ok` lines, no tracebacks.
 
-Setting `go_live_at = now()` at the same instant is what suppresses that backlog.
+Confirm with the owner that **no messages will arrive yet**. Detection is running;
+sending is off until we turn it on deliberately (step 9, which is not done on site).
+
+---
+
+## 9 — Go-live: turning notifications on (NOT on this visit)
+
+⚠️ **Both statements, one transaction. Not the same session — the same transaction.**
+
+During the silent period events accumulate with `notify = false`. Nothing is sent. But
+an event is suppressed only when it is older than `go_live_at`, and `go_live_at` is null
+until now. The moment `notify` becomes true with `go_live_at` still null, **every event
+since installation becomes sendable at once** — the owner's first ever contact from this
+system would be dozens of alerts about last week.
 
 ```sql
 begin;
@@ -200,42 +237,49 @@ update alert_settings
 commit;
 ```
 
-Then confirm the backlog really is suppressed **before** anyone is expecting messages:
+Then confirm the backlog is suppressed, before anyone expects messages:
 
 ```sql
-select count(*) as would_have_been_sent
+select count(*) as suppressed_backlog
 from events e
 join tenants t on t.id = e.tenant_id
 where t.slug = 'sobh_onthefast'
-  and e.occurred_at < t.go_live_at
-  and e.status = 'detected';
+  and e.occurred_at < t.go_live_at;
 ```
 
-**Expected:** whatever the number, none of these will be sent — they are older than
-`go_live_at`. A large number here is normal and is exactly what the guard is for.
+A large number here is normal — it is exactly what the guard is for.
 
-**If `go_live_at` was already set** before you ran this, the first `update` leaves it
-alone (`and go_live_at is null`), which is deliberate: re-running this must never move
-the line forward and re-suppress events that were legitimately sendable.
+`and go_live_at is null` on the first update is deliberate: re-running this must never
+move the line forward and re-suppress events that had legitimately become sendable.
 
 ---
 
-## 7 — Uninstall, if it comes to that
+## 10 — Before a shift report is trusted
+
+After a shift boundary (07:00 or 19:00), open HD Soft's **يومية الخزينة** for that shift
+and compare against `shift_reports.grand_total`.
+
+**Expect:** exactly equal. The formula is `sales + collections − returns − delivery`.
+
+**If any line differs:** photograph the screen and send the row. **Do not adjust
+anything.**
+
+---
+
+## Uninstall
 
 ```powershell
 .\install\uninstall_agent.ps1
 ```
 
-Removes the scheduled task and stops the agent. It does not delete uploaded data, and
-it does not touch the POS database — nothing in this product ever writes there.
+Removes the task and stops the agent. Uploaded data is untouched, and the POS database
+was never written to at any point.
 
----
-
-## What to send us if you get stuck
+## If you get stuck
 
 ```powershell
 Get-Content C:\thirdeyev\agent.log -Tail 100
 ```
 
-Plus the step number you stopped at and the exact message. The log is UTF-8 and
-contains no passwords or tokens.
+Send that, the step number, and the exact message. The log is UTF-8 and contains no
+passwords or tokens.
