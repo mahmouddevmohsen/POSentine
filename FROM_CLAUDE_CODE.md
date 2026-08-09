@@ -4,6 +4,272 @@ Newest section at the top.
 
 ---
 
+# 2026-08-10 00:35 UTC — FINAL. Closing gate passed, pushed. Handover below.
+
+**311 passed** (was 209 at the start of this work), `test_golden.py` exactly **31**.
+Pushed to `origin/main` at **`3e804bc`**. `ship/` rebuilt against the guarded adapter.
+
+Three defects found during the closing gate itself, all fixed. **Two of them would
+have shipped**, and one of them is the exact thing you told me to verify rather than
+assume.
+
+---
+
+## The closing gate
+
+### 🔴 You were right to make me check that the closure test fired. It did not.
+
+I removed `sqlguard.py` from `SHIPPED` and ran the import-closure test. **It passed.**
+
+`_local_imports` walked only the direct imports of the three entry points.
+`sqlguard` is imported by `adapter_hdsoft.py` — one level down — so it was invisible:
+
+```
+agent.py           -> ['adapter_hdsoft', 'logsetup', 'mint_agent_token', 'rows', 'supa']
+preflight.py       -> ['adapter_hdsoft', 'agent', 'mint_agent_token', 'readonly_probe']
+test_golden.py     -> ['adapter_hdsoft', 'events', 'metrics']
+
+adapter_hdsoft.py  -> ['sqlguard']   <-- never walked
+```
+
+A ship folder with no `sqlguard.py` would have passed every check we have and given
+`ModuleNotFoundError` on the till at install time — **with the SQL guard absent
+entirely.** A test called "closed under import" that closes over one level is not a
+closure. Now transitive, and it fails correctly:
+
+```
+E   AssertionError: agent.py reaches ['sqlguard.py'], which ship/ does not contain.
+FAILED test_the_ship_list_is_closed_under_transitive_import[agent.py]
+FAILED test_the_ship_list_is_closed_under_transitive_import[preflight.py]
+FAILED test_the_ship_list_is_closed_under_transitive_import[test_golden.py]
+```
+
+It has a falsifier that fails if `sqlguard` ever becomes a *direct* import of
+`agent.py`, because at that point the test stops proving the walk is deep.
+
+`ship/` rebuilt: `adapter_hdsoft.py` is now `c67cd4913c84` (was `f75ef36e6d34`) — the
+guarded copy. `sqlguard.py` `7c2c0962c7d6` is in it. 25 files.
+
+### 🔴 A fresh clone had no integrity check at all
+
+The rehearsal found this immediately. **`ship/` is gitignored**, so a `git clone` has
+no `ship/` and no `MANIFEST.txt`. Step 0 printed `NOT VERIFIED` — the strongest check
+in the whole procedure, silently downgraded on **the exact path the operator takes.**
+
+`verify_manifest` now falls back to git. A clean checkout of a named commit is a
+*stronger* statement than a manifest, not a weaker one — it ties the machine to the
+commit our tests ran against:
+
+```
+code integrity   OK - clean checkout of commit f33fa8a961e8
+```
+
+Untracked files are ignored deliberately (`--untracked-files=no`): `config.json`,
+`state.json`, `agent.log` and `logs/` all appear after cloning, and treating them as
+drift would stop every real install. An edited **tracked** file stops with the file
+named and `git checkout -- .` as the fix. A copied `ship/` folder keeps using its
+manifest. Five tests, against a real git repo rather than a mock.
+
+### 🔴 VERIFY.md step 7 would have stopped a healthy install
+
+You said to read it against the code. It told the operator:
+
+> Expect `LastTaskResult : 0`.
+
+immediately after registering. **A freshly registered task reports `267011` until its
+first run.** Following the document, the operator stops a perfectly good install — the
+same fault as before, inverted. Now it explains `267011`, and points at the field that
+actually matters:
+
+> **The field that matters right now is `NextRunTime`.** If it is empty, the task is
+> registered but *not scheduled*, and it will never run. **STOP IF `NextRunTime` is
+> empty.**
+
+It also now says **do not use `Start-ScheduledTask`** — starting it yourself proves the
+task *can* run and says nothing about whether it *will*, which is the whole point of
+the wait. The logon-only wording is corrected, and the rollback is documented. Step 0b
+no longer claims preflight writes nothing anywhere: it names step 3b's refused probes,
+`pip`, and the transcript.
+
+### The rehearsal — cloned from GitHub, exactly as he will
+
+```
+git clone https://github.com/mahmouddevmohsen/POSentine.git rehearsal
+```
+
+Then a real `config.json` with a minted 279-character token, and the one-click entry
+point. All six of your steps:
+
+| # | Step | Result |
+|---|---|---|
+| 1 | Clone the pushed repo | ✅ `f33fa8a` |
+| 2 | Place a real `config.json` | ✅ |
+| 3 | Run the one-click entry point | ✅ |
+| 4 | Reach the POS failure and stop cleanly | ✅ |
+| 5 | Transcript exists, readable, no secret | ✅ 123 lines, 3/3 secrets absent |
+| 6 | Diagnostics zip produced, secret-free | ✅ 11 files, 7 KB, 3/3 secrets absent |
+
+It got through integrity, Python, dependencies, config, the decoded token, **31 golden
+tests on the cloned machine**, and stopped at step 3b on the real driver error:
+
+```
+  Failed in PHASE A — VERIFY.md step 3b — read-only proof
+
+  WHAT FAILED
+    could not connect to the POS database: ('08001', '[08001] [Microsoft][ODBC SQL
+    Server Driver][DBNETLIB]SQL Server does not exist or access denied. (17) ...
+
+  THE STATE OF THIS MACHINE
+    Nothing was written to the POS or to the cloud, and
+    no scheduled task was registered. This machine is
+    exactly as it was before you double-clicked.
+```
+
+The diagnostics zip, from the same clone:
+
+```
+config.json present? False
+secrets in zip: NONE
+redacted token : <redacted: 279 chars, sha256:9e8c4af3d908>
+redacted pwd   : <redacted: 22 chars, sha256:379550d10156>
+kept for triage: 57b61b47-... | localhost\HDSOFT | monitor_ro
+```
+
+Both unreachable systems fail soft with a diagnosis rather than a traceback:
+
+```
+readonly_proof.txt  (could not connect to the POS: OperationalError: ('08001', ...
+                    This is itself a finding: the agent cannot read either.
+cloud.txt           (could not reach the cloud: SupaError: HTTP 401 Invalid API key
+                    This is itself a finding: the agent cannot upload either.
+```
+
+**One more found here and fixed:** `task_info.txt` was **empty** when no task was
+registered — "nothing was checked" and "everything is fine" reading identically, in
+the diagnostics file. It now says so in words. My first attempt put the branch in a
+quoted PowerShell one-liner and was a parse error, which would have shipped as a
+mysteriously empty file rather than a loud one; the branch is in Python instead.
+
+### `sqlguard` wiring — verified present, not re-applied
+
+```
+adapter_hdsoft.py:27   import sqlguard
+adapter_hdsoft.py:208  return sqlguard.guard(cn)
+```
+
+`git diff` on the locked file shows those two hunks and nothing else. No other locked
+file is modified. The transcript now prints `sqlguard choke point  ACTIVE`.
+
+---
+
+# HANDOVER
+
+For someone who has to trust this without reading the code.
+
+## What is proven, and by what evidence
+
+| Claim | Evidence |
+|---|---|
+| **The POS is never written to** | 9 zero-row writes attempted at the POS on every install; all must be refused. TRUNCATE/ALTER interrogated via `HAS_PERMS_BY_NAME`, never attempted. `sqlguard` refuses non-`SELECT` at the connection. Source scan fails the build on write SQL — proven by injecting one. |
+| **The agent writes no file outside its folder** | `sys.addaudithook` records every write during a real cycle; test has a falsifier that must catch a deliberate stray write. |
+| **The scheduled task runs by itself** | Registered on a real machine, waited 4 minutes doing nothing, `LastTaskResult 0`, agent ran. Not `Start-ScheduledTask`. |
+| **A failed registration leaves nothing behind** | Forced with an injected post-registration failure: prior task restored **byte-for-byte**, interval back to `PT3M`. |
+| **Logs cannot fill the disk** | 12 MiB ceiling; measured by writing past it — exactly 4 files, newest records kept. |
+| **Logs carry no secret** | A real failing cycle whose errors embed both keys and the SQL password, then grep for every secret including fragments. Falsifier: with masking off, the same run must leak. |
+| **The diagnostics zip carries no secret** | Same grep, over the real zip from the real clone. |
+| **This machine runs the code we verified** | Clean-checkout-of-commit, or `MANIFEST.txt` sha256 per file. |
+| **The numbers are right** | `test_golden.py`, 31 tests, pinned to HD Soft's own يومية الخزينة screen. Run **on the customer's machine** as part of acceptance. |
+
+## What is NOT proven, and cannot be from here
+
+1. **The POS connection succeeding.** There is no SQL Server on any machine we have.
+   Every path through it is exercised against a simulated server; the first real
+   connection happens at the shop.
+2. **`LastTaskResult : 0` from a real cycle.** Proven with a stand-in agent. A real
+   one needs a POS that answers.
+3. **The read-only probe against real SQL Server.** Its error classification
+   (`229`/`230`/`262`) comes from documentation. **If those differ on site, step 3b
+   returns `INCONCLUSIVE` and stops the install** — the safe direction, but it would
+   stop a good install, and you should expect that as a possible outcome.
+4. **The first real shift report.** No shift has ever been computed from live data.
+5. **Windows older than 11.** Task schema is pinned to 1.2 (Windows 7+) and
+   `UseUnifiedSchedulingEngine` is omitted, but nothing older has been tested.
+6. **The dry-run numbers.** Everything downstream of the first real dry run.
+
+## Known limitations
+
+- **A revoked or expired token is silent in the cloud.** A 401 is correctly not
+  retried, but the failure-heartbeat insert 401s too. Loud in `agent.log` on the till,
+  invisible to us. **Our only signal is the absence of heartbeats.** The fix belongs in
+  the orchestrator: alert on heartbeat *silence*, not only on error heartbeats.
+- **The task runs only while the till user is logged on.** Logged out, cycles stop and
+  resume at the next logon. Nothing is lost — the watermark only moves forward.
+- **We do not control the `monitor_ro` login.** Anyone with admin on that machine can
+  change its permissions. We guarantee we *check* on every install, not that it cannot
+  change between installs. `monitor_ro.sql` is written and **not yet applied**.
+- **A clone carries more than `ship/` does** — `fake_adapter.py`, the test suite, and
+  our `TO_CLAUDE_CODE.md` / `FROM_CLAUDE_CODE.md` correspondence all land on the till.
+  No secrets, and `fake_adapter` is only reachable via `--fake`, which the task never
+  passes. **The clean answer is a GitHub Release zip built from `ship/`** rather than a
+  clone. Not built; recommended.
+- **`pip install` is not reversed by the uninstall.** Removing shared packages could
+  break anything else on that machine using Python.
+- **Read-only does not mean nothing leaves.** Invoices, line items, cash counts, item
+  names and staff IDs are uploaded. What we send is in `rows.py`.
+
+## What the operator does at the shop
+
+1. `git clone https://github.com/mahmouddevmohsen/POSentine.git` into a folder on the
+   till, or download it from GitHub.
+2. Put `config.json` next to `agent.py` — copied from `config.example.json`, filled in.
+   **Never paste the token into a terminal.**
+3. **Double-click `INSTALL.bat`.** That is the whole install.
+4. Wait. It takes about 10 minutes and most of that is Phase E waiting for the
+   scheduled task to fire on its own. **Do not close the window.**
+5. **If it stops:** photograph the screen, change nothing, call. The screen names what
+   failed, which VERIFY.md step, what to do, and what state the machine is in.
+6. **If it finishes:** it prints what was checked, what runs now, and where the logs
+   are. Tell the owner **no messages will arrive yet.**
+
+### What he sends back
+
+- If it stopped: the photograph, plus `logs\install_*.txt`.
+- If anything looks wrong later, at any point: **double-click
+  `collect_diagnostics.bat` and send the one zip.** It contains no password and no
+  token. That replaces the conversation.
+
+## Deliberately deferred
+
+- **`orchestrator.py`** — event detection, deletion inference, mirroring anomalies into
+  `internal_anomalies` under `service_role`. Must fit `report.py` and `metrics.py`'s
+  existing signatures; both are locked.
+- **`notifier/telegram.py`** — no Telegram token ever reaches the customer machine.
+- **The two GitHub workflows**, with `audit_privileges.py` wired into keepalive.
+- **VERIFY.md step 9, go-live** — two SQL statements, **one transaction**, run from our
+  side. Not on this visit. If `notify` becomes true while `go_live_at` is still null,
+  the owner's first ever contact from this system is dozens of alerts about last week.
+- **Priority 4 (PyInstaller, config-from-prompt)** — unevaluated. What I wrote last
+  time were **priors, not findings**, and they stay labelled that way.
+- **A silent week** reconciling daily against HD Soft's own screen before go-live.
+
+---
+
+## The habit, since you named it
+
+The three checks that shared the fault they were meant to detect — watermark-0, the
+manifest hashes, the trigger — all have the same tell: **the check and the thing it
+checks reading one source.** Two more turned up in this session alone. The closure test
+walking one level and calling itself a closure. And `task_info.txt` being empty, where
+"no task" and "we did not look" render identically.
+
+The question that finds them is cheap: *what would this check still pass if it were
+broken?* I asked it of Phase E before writing the wait, and of the closure test because
+you told me to. Both times it paid.
+
+Good project to have worked on.
+
+---
+
 # 2026-08-09 21:05 UTC — Priority Zero done. And the scheduled task never ran.
 
 **302 passed** (was 209), `test_golden.py` still exactly **31**, no locked file
