@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -94,9 +95,65 @@ NOT_YET_BUILT: tuple[tuple[str, str], ...] = ()
 
 FORBIDDEN = ("config.json", "state.json", ".env")
 
+# Line endings, per .gitattributes: Windows runs the scripts, so those are
+# CRLF; everything else is LF. Checked before hashing, because a manifest
+# is only meaningful if the bytes it describes are the bytes a checkout
+# produces. See check_line_endings().
+CRLF_SUFFIXES = (".ps1", ".bat")
+
 
 def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def check_line_endings() -> None:
+    """Refuse to hash a working tree whose bytes a checkout would not produce.
+
+    This exists because it happened. A build ran against a working copy that
+    had picked up CRLF in agent.py, supa.py and config.example.json — a tool
+    on this machine had written them with Windows newline translation. The
+    manifest was correct about that working copy and wrong about the
+    repository, and nothing noticed: preflight compared ship/ against the
+    same working tree and agreed with itself.
+
+    That is the same shape as the watermark-0 trap — two answers from one
+    wrong source, agreeing. So it is checked here rather than trusted.
+    """
+    wrong: list[str] = []
+    for name, _why in SHIPPED:
+        raw = (HERE / name).read_bytes()
+        wants_crlf = Path(name).suffix in CRLF_SUFFIXES
+        has_crlf = b"\r\n" in raw
+        has_lone_lf = raw.replace(b"\r\n", b"") .count(b"\n") > 0
+        if wants_crlf and has_lone_lf:
+            wrong.append(f"{name}: expected CRLF throughout, found bare LF")
+        elif not wants_crlf and has_crlf:
+            wrong.append(f"{name}: expected LF, found CRLF")
+    if wrong:
+        raise SystemExit(
+            "error: line endings do not match .gitattributes:\n  "
+            + "\n  ".join(wrong)
+            + "\n\n       The bytes here are not the bytes a clean checkout"
+              "\n       produces, so every sha256 below would describe this"
+              "\n       machine rather than the repository. Fix with:"
+              "\n           git checkout -- <file>"
+        )
+
+
+def git_revision() -> str:
+    """Stamp the manifest with what it was built from, so a folder on a
+    customer machine can be traced back to a commit rather than to a date."""
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(HERE),
+                              capture_output=True, text=True, timeout=10)
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=str(HERE),
+                               capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown (git not available)"
+    if head.returncode != 0:
+        return "unknown (not a git checkout)"
+    revision = head.stdout.strip()
+    return revision + (" +uncommitted changes" if dirty.stdout.strip() else "")
 
 
 def check_list() -> None:
@@ -151,6 +208,7 @@ def clear_ship() -> None:
 
 def build() -> int:
     check_list()
+    check_line_endings()
     clear_ship()
     SHIP.mkdir(parents=True)
 
@@ -172,6 +230,8 @@ def build() -> int:
         "# POSentine — ship manifest",
         "# sha256 of every file in this folder, as built from the repository.",
         "# preflight.py checks these before it checks anything else.",
+        "#",
+        f"# built from: {git_revision()}",
         "#",
         "# config.json is NOT here and must never be. It is placed on the",
         "# machine separately and holds the SQL password and the agent token.",

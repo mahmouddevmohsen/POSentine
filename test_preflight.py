@@ -21,7 +21,7 @@ the reason this file is worth its weight:
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 
 import pytest
 
@@ -384,6 +384,33 @@ def test_the_ship_list_is_closed_under_import(entry):
         f"{entry} imports {missing}, which ship/ does not contain. "
         "The agent would raise ImportError on the customer machine."
     )
+
+
+def test_every_shipped_file_has_the_line_endings_a_checkout_produces():
+    """A build once hashed a working copy that had picked up CRLF in three
+    files. The manifest was right about that machine and wrong about the
+    repository, and preflight agreed with it because both read the same
+    working tree. Checked here so a dirty checkout cannot be shipped."""
+    import make_ship as S
+    S.check_line_endings()          # raises SystemExit with the offenders
+
+
+def test_the_line_ending_rule_still_matches_gitattributes():
+    """If .gitattributes changes, make_ship's CRLF_SUFFIXES must follow it,
+    or the guard above starts enforcing a rule nobody agreed to."""
+    import make_ship as S
+    attrs = (P.HERE / ".gitattributes").read_text(encoding="utf-8")
+    for suffix in S.CRLF_SUFFIXES:
+        assert re.search(rf"^\*{re.escape(suffix)}\s+text eol=crlf", attrs,
+                         re.MULTILINE), f"{suffix} is no longer pinned to CRLF"
+
+
+def test_the_manifest_records_what_it_was_built_from():
+    """A ship folder on a customer machine should be traceable to a commit,
+    not to a date and a memory."""
+    import make_ship as S
+    revision = S.git_revision()
+    assert revision and revision != "unknown (not a git checkout)"
 
 
 def test_the_golden_baseline_needs_pytest_on_that_machine():

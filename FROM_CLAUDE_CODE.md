@@ -4,6 +4,86 @@ Newest section at the top.
 
 ---
 
+# 2026-08-09 08:52 UTC — the manifest hashes you verified were wrong. Fixed.
+
+Correction to the section below, found while committing. It is the same
+failure shape as the watermark-0 trap, so it is worth your attention.
+
+**Your check `ship/ sha256 vs repo — 8/8 identical` passed, and it could not have
+failed.** Both sides read the same working tree. The working tree was not what a
+clean checkout produces.
+
+Git warned on commit:
+
+```
+warning: in the working copy of 'make_ship.py', CRLF will be replaced by LF
+```
+
+Three shipped files had picked up CRLF in the working copy — a tool on this machine
+wrote them through Windows newline translation at some point. `.gitattributes` pins
+`*.py` to `eol=lf`, and every committed blob is LF (checked: no tracked blob contains
+CRLF), so a fresh clone produces different bytes than what I hashed. After
+`git checkout -- .`:
+
+```
+file                     before         after clean-checkout bytes
+adapter_hdsoft.py        f75ef36e6d34   f75ef36e6d34
+agent.py                 9b7ba54265ae   48cdcba4e691    <-- CHANGED
+config.example.json      b3920bc9c8f3   572aa1da6e50    <-- CHANGED
+events.py                f563acca496e   f563acca496e
+metrics.py               3672f30e9889   3672f30e9889
+mint_agent_token.py      a1cc7d331827   a1cc7d331827
+report.py                fad3785f92d9   fad3785f92d9
+rows.py                  49a1764a5c56   49a1764a5c56
+supa.py                  49ae9f26c9f1   c72382c0f3c3    <-- CHANGED
+test_golden.py           8752bc77dfcc   8752bc77dfcc
+```
+
+**Every locked file is unaffected** — they were already LF, which is why
+`git diff HEAD~2 HEAD` on them came back empty for you and stays empty. Nothing in
+them changed. The three that moved are `agent.py`, `supa.py`, `config.example.json`,
+and only their line endings.
+
+**Consequence if it had shipped:** the manifest would have been correct about my
+machine and wrong about the repository. Nobody would have noticed until someone
+rebuilt `ship/` from a clean clone and got a different `MANIFEST.txt` for identical
+source — or worse, until a "code integrity" stop on site for a file nobody had
+touched.
+
+**Guard added,** because I do not want this decided by whoever last opened a file in
+which editor. `make_ship.py` now refuses to build when a shipped file's line endings
+disagree with `.gitattributes`, before it hashes anything:
+
+```
+### 1. correct tree - must build ###
+  built D:\New folder (2)\New folder\ship
+
+### 2. reintroduce the exact fault (agent.py -> CRLF) ###
+error: line endings do not match .gitattributes:
+  agent.py: expected LF, found CRLF
+
+       The bytes here are not the bytes a clean checkout
+       produces, so every sha256 below would describe this
+       machine rather than the repository. Fix with:
+           git checkout -- <file>
+--- exit=1 ---
+```
+
+`MANIFEST.txt` is also stamped with the revision it was built from, so a folder on a
+customer machine traces back to a commit rather than to a memory:
+
+```
+# built from: 58a0788089a798fc4ab56811f4270b204853cc80 +uncommitted changes
+```
+
+Three tests cover it: the guard passes on the current tree, `CRLF_SUFFIXES` still
+matches what `.gitattributes` pins, and the revision stamp resolves.
+
+**209 passed**, `test_golden.py` still **31**. The hashes in the section below are
+superseded by the ones above; the current `ship/MANIFEST.txt` is authoritative.
+
+---
+
 # 2026-08-09 08:35 UTC — Priority 1 done. Priority 2 I am pushing back on.
 
 `install_agent.ps1`, `uninstall_agent.ps1` and `run_agent.ps1` are built, tested,
