@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy to config.json and fill in. config.json is gitignored and must never be committed. The agent token is minted with mint_agent_token.py; service_role must never appear on this machine.",
+
+  "tenant_id": "57b61b47-a590-49fe-803c-0c174a07b7ec",
+  "source_id": "93f8d146-ba68-4d58-8eda-f797f3e28bd4",
+
+  "supabase_url": "https://mwwjfeporhfhcekmektg.supabase.co",
+  "supabase_anon_key": "<anon public key — admits at the API gateway>",
+  "supabase_agent_token": "<from mint_agent_token.py — carries tenant_id for RLS>",
+
+  "sql": {
+    "server": "localhost\\HDSOFT",
+    "database": "HD_Rest_Cashier",
+    "user": "monitor_ro",
+    "password": "<monitor_ro password>"
+  },
+
+  "sync_seconds": 180,
+  "rescan_every_n_cycles": 5,
+  "reference_every_n_cycles": 20
+}
