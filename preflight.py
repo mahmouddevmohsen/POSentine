@@ -185,6 +185,57 @@ def read_manifest(path: Path) -> dict[str, str]:
     return entries
 
 
+def verify_with_git(root: Path) -> str | None:
+    """Integrity for a folder that came from `git clone` rather than ship/.
+
+    The operator clones the repository at the shop, and a clone has no
+    `MANIFEST.txt` — `ship/` is generated and deliberately never committed.
+    Without this, the strongest check in the whole procedure would silently
+    downgrade to "NOT VERIFIED" on the exact path the operator actually
+    takes, which is worse than the check not existing.
+
+    A clean checkout is a *stronger* statement than a manifest, not a
+    weaker one: it says every tracked file matches a named commit, and the
+    commit is the thing our tests ran against. Untracked files are ignored
+    on purpose — config.json, state.json, agent.log and logs/ are all
+    created here after cloning.
+
+    Returns None when this is not a git checkout, so the caller can fall
+    through to saying so.
+    """
+    def git(*args: str) -> tuple[int, str]:
+        try:
+            done = subprocess.run(["git", *args], cwd=str(root),
+                                  capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return 1, ""
+        return done.returncode, done.stdout.strip()
+
+    code, revision = git("rev-parse", "HEAD")
+    if code != 0 or not revision:
+        return None
+
+    # --untracked-files=no deliberately: an edited tracked file is drift, a
+    # new config.json is not.
+    code, dirty = git("status", "--porcelain", "--untracked-files=no")
+    if code != 0:
+        return None
+    if dirty:
+        # `XY <path>`, but the whole block has been stripped, so the leading
+        # status column may already be gone. Split on whitespace rather than
+        # slicing a fixed offset — that offset was wrong and turned
+        # "agent.py" into "gent.py" in the failure message.
+        edited = sorted(line.split(maxsplit=1)[-1]
+                        for line in dirty.splitlines() if line.strip())
+        raise Stop("0 — code integrity",
+                   f"files in this clone have been edited: {edited}",
+                   "This machine is not running the code the tests were run\n"
+                   "    against. Restore them and start again:\n"
+                   "        git checkout -- .\n"
+                   "    Do not edit files here.")
+    return f"code integrity   OK — clean checkout of commit {revision[:12]}"
+
+
 def verify_manifest(root: Path) -> str:
     """Check every shipped file against its recorded hash.
 
@@ -192,13 +243,18 @@ def verify_manifest(root: Path) -> str:
     are all created on the customer machine after packaging. Missing or
     altered ones are.
 
-    Returns a one-line status for the closing summary. A missing manifest is
-    reported as NOT VERIFIED rather than passed over: "nothing was checked"
-    and "everything checked out" must never look the same.
+    Returns a one-line status for the closing summary. A folder that is
+    neither a ship/ folder nor a clean checkout is reported as NOT VERIFIED
+    rather than passed over: "nothing was checked" and "everything checked
+    out" must never look the same.
     """
     path = root / MANIFEST_NAME
     if not path.exists():
-        return "code integrity   NOT VERIFIED — no MANIFEST.txt in this folder"
+        from_git = verify_with_git(root)
+        if from_git:
+            return from_git
+        return ("code integrity   NOT VERIFIED — no MANIFEST.txt, and this is "
+                "not a clean git checkout")
 
     try:
         entries = read_manifest(path)

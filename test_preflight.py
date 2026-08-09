@@ -503,3 +503,77 @@ def test_the_golden_count_matches_the_file_we_ship():
                           "--collect-only", "test_golden.py"],
                          cwd=str(P.HERE), capture_output=True, text=True)
     assert f"{P.GOLDEN_TEST_COUNT} tests collected" in out.stdout, out.stdout
+
+
+# ════════════════════════════════════════════════════════════════
+# integrity for the folder the operator actually gets
+# ════════════════════════════════════════════════════════════════
+
+def _git(path, *args):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=str(path), capture_output=True,
+                          text=True)
+
+
+def _tiny_repo(tmp_path):
+    """A real git checkout, because this checks real git behaviour."""
+    repo = tmp_path / "clone"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "agent.py").write_bytes(b"# agent\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "first")
+    return repo
+
+
+def test_a_clean_clone_is_verified_even_without_a_manifest(tmp_path):
+    """🔴 The operator clones from GitHub at the shop. A clone has no
+    MANIFEST.txt — ship/ is generated and never committed — so without this
+    the strongest check in the procedure silently downgraded to NOT
+    VERIFIED on the exact path he actually takes."""
+    repo = _tiny_repo(tmp_path)
+    status = P.verify_manifest(repo)
+    assert status.startswith("code integrity   OK")
+    assert "clean checkout of commit" in status
+
+
+def test_an_edited_clone_stops(tmp_path):
+    repo = _tiny_repo(tmp_path)
+    (repo / "agent.py").write_bytes(b"# tampered\n")
+    with pytest.raises(P.Stop) as caught:
+        P.verify_manifest(repo)
+    assert "agent.py" in caught.value.what
+    assert "git checkout" in caught.value.do
+
+
+def test_files_the_operator_creates_do_not_look_like_tampering(tmp_path):
+    """config.json, state.json, agent.log and logs/ all appear after
+    cloning. Treating them as drift would stop every real install."""
+    repo = _tiny_repo(tmp_path)
+    (repo / "config.json").write_bytes(b"{}")
+    (repo / "state.json").write_bytes(b"{}")
+    (repo / "agent.log").write_bytes(b"log")
+    (repo / "logs").mkdir()
+    assert P.verify_manifest(repo).startswith("code integrity   OK")
+
+
+def test_a_folder_that_is_neither_says_so_rather_than_passing(tmp_path):
+    plain = tmp_path / "loose"
+    plain.mkdir()
+    (plain / "agent.py").write_bytes(b"# agent\n")
+    status = P.verify_manifest(plain)
+    assert "NOT VERIFIED" in status
+
+
+def test_a_ship_folder_still_uses_its_manifest(tmp_path):
+    """The manifest must keep winning where it exists: a ship/ folder copied
+    onto a machine has no .git at all."""
+    shipped = tmp_path / "ship"
+    shipped.mkdir()
+    body = b"# agent\n"
+    (shipped / "agent.py").write_bytes(body)
+    (shipped / "MANIFEST.txt").write_bytes(
+        (hashlib.sha256(body).hexdigest() + "  agent.py\n").encode())
+    assert P.verify_manifest(shipped).startswith("code integrity   OK — 1 files")
