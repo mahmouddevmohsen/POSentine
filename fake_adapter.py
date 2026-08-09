@@ -144,6 +144,19 @@ def _dataset() -> tuple[list[Invoice], list[InvoiceLine]]:
     return invoices, lines
 
 
+def max_salid(_cn) -> int:
+    """Day-Zero initialisation: learn the ceiling without reading behind it."""
+    invoices, _lines = _dataset()
+    return max(i.salid for i in invoices)
+
+
+def raw_counts(_cn, watermark_salid: int) -> tuple[int, int]:
+    """The bare cross-check, on the same fixture data."""
+    invoices, lines = _dataset()
+    kept = {i.salid for i in invoices if i.salid > watermark_salid}
+    return len(kept), len([ln for ln in lines if ln.salid > watermark_salid])
+
+
 def pull(cn, watermark_salid: int, rescan_from_salid: int,
          do_rescan: bool, do_reference: bool) -> PullResult:
     invoices, lines = _dataset()

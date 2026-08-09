@@ -95,6 +95,61 @@ def mint(secret: str, tenant_id: str, issued_at: _dt.datetime,
     return f"{signing_input}.{_b64url(signature)}"
 
 
+def decode_claims(token: str) -> dict:
+    """
+    Read a JWT's claims without verifying the signature.
+
+    For inspection only — we are checking what a token *says about itself*
+    before we ship it, not trusting it. Verification is the server's job.
+
+    This exists because `'service_role' in token` is a check that cannot
+    work: a JWT is base64, so the literal string never appears, and the
+    test returns False for an actual service_role key. A safety check that
+    always passes is worse than no check.
+    """
+    try:
+        payload = token.split(".")[1]
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        claims = json.loads(raw)
+    except (IndexError, ValueError, TypeError) as exc:
+        raise ValueError(f"not a readable JWT: {exc}") from None
+    if not isinstance(claims, dict):
+        raise ValueError("JWT payload is not an object")
+    return claims
+
+
+def assert_is_agent_token(token: str, expected_tenant_id: str) -> None:
+    """
+    Refuse anything that is not a tenant-scoped agent token.
+
+    Both failures are silent otherwise: a service_role key bypasses every
+    access rule on a machine we do not control, and a token minted for the
+    wrong tenant authenticates perfectly, matches no rows, and uploads into
+    nothing for weeks.
+    """
+    claims = decode_claims(token)
+
+    role = claims.get("role")
+    if role != ROLE:
+        raise ValueError(
+            f"agent token has role={role!r}, must be {ROLE!r}. "
+            "A service_role key bypasses every access rule and must never "
+            "exist on the customer machine."
+        )
+
+    tenant = claims.get("tenant_id")
+    if not tenant:
+        raise ValueError(
+            "agent token carries no tenant_id claim — RLS would match "
+            "nothing and every upload would silently affect zero rows"
+        )
+    if tenant != expected_tenant_id:
+        raise ValueError(
+            f"agent token is for tenant {tenant}, but config says "
+            f"{expected_tenant_id}. It would authenticate and match nothing."
+        )
+
+
 def _read_secret() -> str:
     """Environment first, then stdin. Never a file, never a CLI argument
     (arguments show up in process listings and shell history)."""

@@ -45,10 +45,18 @@ from pathlib import Path
 from typing import Any
 
 import adapter_hdsoft as default_adapter
+import mint_agent_token
 import rows as R
 import supa
 
 LOCK_STALE_SECONDS = 15 * 60
+
+# A cycle never uploads more than this many new invoices. It matters most
+# after an outage: an agent down for a month comes back to a five-figure
+# backlog, and pushing it in one cycle during service is its own incident.
+# The backlog drains over subsequent cycles and the cap is logged each time
+# it bites, so a persistent one is visible rather than merely survived.
+MAX_INVOICES_PER_CYCLE = 5000
 LOG = logging.getLogger("posentine.agent")
 
 EXIT_OK = 0
@@ -126,6 +134,12 @@ class Config:
                 f"config still has unfilled placeholder values: {placeholders} "
                 "— replace them with real values before running the agent"
             )
+
+        # Decode the token and read its claims. Refusing here means a
+        # service_role key or a wrong-tenant token cannot reach a live
+        # request at all.
+        mint_agent_token.assert_is_agent_token(raw["supabase_agent_token"],
+                                               raw["tenant_id"])
         return Config(
             tenant_id=raw["tenant_id"],
             source_id=raw["source_id"],
@@ -142,6 +156,10 @@ class Config:
 @dataclass
 class State:
     """Local mirror of sync_state, plus the product snapshot."""
+    # False until the first run has adopted MAX(salid). "No backfill" has
+    # to mean something in practice: a fresh install must not drag 218,207
+    # invoices and 481,293 lines across during service.
+    initialised: bool = False
     cycle_index: int = 0
     watermark_salid: int = 0
     watermark_saledeid: int = 0
@@ -252,6 +270,45 @@ def _lock_file(fh) -> None:
 # one cycle
 # ════════════════════════════════════════════════════════════════
 
+def sql_max_salid(cn) -> int:
+    """
+    Deliberately dumb, and deliberately not adapter.pull(): first-run
+    initialisation must learn MAX(salid) *without* reading anything behind
+    it. SELECT only.
+    """
+    cur = cn.cursor()
+    cur.execute("SELECT ISNULL(MAX(salid), 0) FROM dbo.Sales WITH (NOLOCK)")
+    return int(cur.fetchone()[0])
+
+
+def sql_raw_counts(cn, watermark_salid: int) -> tuple[int, int]:
+    """
+    The acceptance comparison, run here rather than in SSMS — neither SSMS
+    nor sqlcmd exists on the POS machine, so the single most important
+    check of the visit would otherwise be unrunnable.
+
+    A separate, bare query against the same source: different code path,
+    no joins, no classification, no guards. If it disagrees with what the
+    adapter produced, something is wrong with how we read their data.
+    """
+    cur = cn.cursor()
+    cur.execute("SELECT COUNT(*) FROM dbo.Sales WITH (NOLOCK) WHERE salid > ?",
+                watermark_salid)
+    invoices = int(cur.fetchone()[0])
+    cur.execute("SELECT COUNT(*) FROM dbo.SalesDe WITH (NOLOCK) WHERE saleid > ?",
+                watermark_salid)
+    lines = int(cur.fetchone()[0])
+    return invoices, lines
+
+
+def _raw_counts(adapter, cn, watermark_salid: int) -> tuple[int, int]:
+    return getattr(adapter, "raw_counts", sql_raw_counts)(cn, watermark_salid)
+
+
+def _max_salid(adapter, cn) -> int:
+    return getattr(adapter, "max_salid", sql_max_salid)(cn)
+
+
 @dataclass
 class CycleResult:
     invoices: list[dict[str, Any]] = field(default_factory=list)
@@ -264,6 +321,12 @@ class CycleResult:
     did_reference: bool = False
     unknown_itids: list[int] = field(default_factory=list)
     pull: Any = None
+    # Highest salid we actually read. NOT pull.max_salid, which is MAX over
+    # the whole table and includes rows the 30-second dirty-read guard held
+    # back — advancing to that would step over invoices we never read.
+    watermark_target: int = 0
+    capped: bool = False
+    new_invoice_count: int = 0
 
 
 def _merge(primary: list, extra: list, key) -> list:
@@ -302,9 +365,27 @@ def build_cycle(adapter, cn, cfg: Config, state: State,
         result.users = [R.user_payload(u, cfg.tenant_id, cfg.source_id)
                         for u in pulled.users]
 
-    invoices = _merge(pulled.new_invoices, pulled.rescanned_invoices,
+    # ── the per-cycle ceiling ───────────────────────────────────
+    new_invoices = sorted(pulled.new_invoices, key=lambda i: i.salid)
+    result.new_invoice_count = len(new_invoices)
+    if len(new_invoices) > MAX_INVOICES_PER_CYCLE:
+        result.capped = True
+        new_invoices = new_invoices[:MAX_INVOICES_PER_CYCLE]
+        LOG.warning(
+            "backlog: %d new invoices waiting, cap is %d — uploading the "
+            "oldest %d this cycle and the rest will follow. A backlog that "
+            "persists across cycles means the agent was down for a long time.",
+            result.new_invoice_count, MAX_INVOICES_PER_CYCLE, len(new_invoices))
+    kept = {i.salid for i in new_invoices}
+    new_lines = [ln for ln in pulled.new_lines if ln.salid in kept]
+
+    # Follow what was read, never MAX(salid) over the table.
+    result.watermark_target = (max(i.salid for i in new_invoices)
+                               if new_invoices else state.watermark_salid)
+
+    invoices = _merge(new_invoices, pulled.rescanned_invoices,
                       lambda i: i.salid)
-    lines = _merge(pulled.new_lines, pulled.rescanned_lines,
+    lines = _merge(new_lines, pulled.rescanned_lines,
                    lambda ln: ln.saledeid)
 
     # An item we have never seen must not silently become list_price 0.
@@ -395,17 +476,18 @@ def advance_sync_state(client: supa.Supa, cfg: Config, state: State,
     base = {"tenant_id": f"eq.{cfg.tenant_id}", "source_id": f"eq.{cfg.source_id}"}
     now = R.utc_ts(stamp)
 
+    target = result.watermark_target
     applied = client.update(
         "sync_state",
-        {**base, "watermark_salid": f"lt.{pulled.max_salid}"},
-        {"watermark_salid": pulled.max_salid,
+        {**base, "watermark_salid": f"lt.{target}"},
+        {"watermark_salid": target,
          "watermark_saledeid": pulled.max_saledeid,
          "pos_max_salid": pulled.max_salid,
          "last_sync_at": now},
     )
     if not applied:
         LOG.info("watermark already at or beyond %d — a newer cycle got there "
-                 "first; leaving it alone", pulled.max_salid)
+                 "first; leaving it alone", target)
 
     # last_sync_at must move even on a cycle that found no new invoices,
     # otherwise a quiet shop looks identical to a stalled agent.
@@ -495,15 +577,80 @@ def print_dry_run(result: CycleResult, state: State, driver: str,
         w("  ✔ every line matched a product; no NULL list_price")
     for kind, detail in result.anomalies:
         w(f"  ⚠ anomaly: {kind} {detail}")
-    w("")
-    w("  Compare against the POS directly:")
-    w(f"    SELECT COUNT(*) FROM Sales WITH (NOLOCK) "
-      f"WHERE salid > {state.watermark_salid};")
-    w(f"  Expect that count to be >= {len(result.invoices)}. Invoices newer")
-    w(f"  than {default_adapter.DIRTY_READ_GUARD_SECONDS} seconds are held "
-      "back on purpose (NOLOCK can read a")
-    w("  write that later rolls back), so a small excess is correct.")
+    _print_comparison(result, state, w)
     w("=" * 62)
+
+
+def _print_first_run(top_salid: int, out=None) -> None:
+    out = out or sys.stdout
+    print("=" * 62, file=out)
+    print("POSentine agent — FIRST RUN (nothing is written, anywhere)",
+          file=out)
+    print("=" * 62, file=out)
+    print(f"  This machine has no state yet. A real run would adopt", file=out)
+    print(f"  watermark_salid = {top_salid} (the POS MAX(salid)) and read", file=out)
+    print("  nothing behind it.", file=out)
+    print("", file=out)
+    print("  History is not backfilled, by design. Reading it would drag the", file=out)
+    print("  entire sales table across during service, and no report is ever", file=out)
+    print("  built from data recorded before we started watching.", file=out)
+    print("", file=out)
+    print("  Expected here: 'invoices to upload' is 0 on a first install.", file=out)
+    print("  A number in the thousands means STOP AND CALL.", file=out)
+    print("=" * 62, file=out)
+
+
+TOLERANCE = 5
+
+
+def _print_comparison(result: CycleResult, state: State, w) -> None:
+    """
+    The acceptance check, run here because the POS machine has neither SSMS
+    nor sqlcmd. A bare COUNT(*) against the same tables, no joins and no
+    classification, compared with what the adapter produced.
+    """
+    raw = getattr(result, "raw_counts", None)
+    w("  Cross-check against a bare count of the same tables")
+    w(f"    SELECT COUNT(*) FROM dbo.Sales   WITH (NOLOCK) "
+      f"WHERE salid  > {state.watermark_salid}")
+    w(f"    SELECT COUNT(*) FROM dbo.SalesDe WITH (NOLOCK) "
+      f"WHERE saleid > {state.watermark_salid}")
+    if raw is None:
+        w("    (not run)")
+        return
+
+    raw_inv, raw_lines = raw
+    new_inv = result.new_invoice_count
+    delta = raw_inv - new_inv
+    w("")
+    w(f"    bare COUNT(*) invoices   {raw_inv}")
+    w(f"    agent would read         {new_inv}")
+    w(f"    delta                    {delta}")
+    w(f"    bare COUNT(*) lines      {raw_lines}")
+    w("")
+
+    if result.capped:
+        w(f"  VERDICT: CAPPED — {new_inv} of {raw_inv} this cycle "
+          f"(ceiling {MAX_INVOICES_PER_CYCLE}).")
+        w("  The remainder follows on later cycles. Expected only after an")
+        w("  outage; on a fresh install it means Day Zero did not run.")
+    elif delta < 0:
+        w(f"  VERDICT: ABORT — the agent claims {-delta} more invoice(s) than")
+        w("  the POS has. This is not a timing artefact. Photograph this")
+        w("  screen, change nothing, and call.")
+    elif delta > TOLERANCE:
+        w(f"  VERDICT: ABORT — delta {delta} exceeds the tolerance of "
+          f"{TOLERANCE}.")
+        w(f"  Only invoices newer than "
+          f"{default_adapter.DIRTY_READ_GUARD_SECONDS} seconds should be")
+        w("  missing. Photograph this screen, change nothing, and call.")
+    else:
+        w(f"  VERDICT: PASS — delta {delta}, within the tolerance of "
+          f"{TOLERANCE}.")
+        w(f"  Invoices newer than "
+          f"{default_adapter.DIRTY_READ_GUARD_SECONDS} seconds are held back")
+        w("  on purpose: NOLOCK can read a write that later rolls back, which")
+        w("  would raise a deletion alert for a receipt that never existed.")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -615,7 +762,36 @@ def run_once(cfg: Config, state: State, state_path: Path, adapter,
         driver = adapter.pick_driver()
         cn = adapter.connect(**cfg.sql)
         adapter.verify_schema(cn)
+
+        # ── Day Zero ────────────────────────────────────────────
+        # A fresh install adopts MAX(salid) and reads nothing behind it.
+        # Without this, the first cycle pulls the entire history — on the
+        # real database 218,207 invoices and 481,293 lines, during service.
+        # There is no backfill by design; this is what that means.
+        if not state.initialised:
+            top = _max_salid(adapter, cn)
+            if dry_run:
+                _print_first_run(top)
+                return EXIT_OK
+            state.initialised = True
+            state.watermark_salid = top
+            state.rescan_from_salid = top
+            state.save(state_path)
+            client.update("sync_state",
+                          {"tenant_id": f"eq.{cfg.tenant_id}",
+                           "source_id": f"eq.{cfg.source_id}",
+                           "watermark_salid": f"lt.{top}"},
+                          {"watermark_salid": top, "rescan_from_salid": top,
+                           "pos_max_salid": top, "last_sync_at": R.utc_ts(now_utc)},
+                          returning=False)
+            LOG.info("first run: adopted watermark %d and read nothing behind "
+                     "it. History is not backfilled by design.", top)
+            return EXIT_OK
+
         result = build_cycle(adapter, cn, cfg, state, now_utc)
+        if dry_run:
+            result.raw_counts = _raw_counts(adapter, cn,      # type: ignore[attr-defined]
+                                            state.watermark_salid)
     except default_adapter.RestoreSuspected as exc:
         LOG.error("restore suspected: %s", exc)
         if not dry_run and client is not None:
@@ -661,7 +837,9 @@ def run_once(cfg: Config, state: State, state_path: Path, adapter,
         _beat_failure(client, cfg, "upload_failed", str(exc), agent_version)
         return EXIT_ERROR
 
-    state.watermark_salid = pulled.max_salid
+    # The local mirror follows the same rule as the remote write: what we
+    # actually read, never MAX(salid) over the table.
+    state.watermark_salid = result.watermark_target
     state.watermark_saledeid = pulled.max_saledeid
     state.last_date_change_rows = pulled.date_change_rows
     if result.did_rescan:

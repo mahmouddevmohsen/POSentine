@@ -73,7 +73,8 @@ def paths(tmp_path):
 
 
 def fresh_state():
-    return A.State()
+    """An agent that is already installed. Day Zero has its own tests."""
+    return A.State(initialised=True)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -98,7 +99,7 @@ def test_dry_run_reports_what_it_would_upload(paths, capsys):
     out = capsys.readouterr().out
     assert "DRY RUN" in out and "nothing is written" in out
     assert "invoices to upload" in out
-    assert "SELECT COUNT(*) FROM Sales" in out
+    assert "SELECT COUNT(*) FROM dbo.Sales" in out
     assert "cash" in out and "external" in out and "return" in out
 
 
@@ -467,6 +468,168 @@ def test_confirm_flags_silence(capsys):
 # ════════════════════════════════════════════════════════════════
 # 8) config
 # ════════════════════════════════════════════════════════════════
+
+def _write_config(tmp_path, token, tenant="57b61b47-a590-49fe-803c-0c174a07b7ec"):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({
+        "tenant_id": tenant, "source_id": "s",
+        "supabase_url": "https://x.supabase.co",
+        "supabase_anon_key": "anon", "supabase_agent_token": token,
+        "sql": {"server": "x"}}), encoding="utf-8")
+    return p
+
+
+def _token(role="authenticated", tenant="57b61b47-a590-49fe-803c-0c174a07b7ec"):
+    import base64
+    import hashlib
+    import hmac
+    import mint_agent_token as m
+    head = m._segment({"alg": "HS256", "typ": "JWT"})
+    body = m._segment({"role": role, "tenant_id": tenant, "aud": "authenticated"})
+    sig = base64.urlsafe_b64encode(
+        hmac.new(b"k", f"{head}.{body}".encode(), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    return f"{head}.{body}.{sig}"
+
+
+# ════════════════════════════════════════════════════════════════
+# 8b) 🔴 the agent token must be decoded, not string-matched
+# ════════════════════════════════════════════════════════════════
+
+def test_service_role_token_is_rejected_by_decoding_the_claim(tmp_path):
+    """
+    A JWT is base64: the literal text 'service_role' never appears in it,
+    so `'service_role' in token` returns False for an actual service_role
+    key. A check that always passes is worse than no check — it
+    manufactures confidence. The claim must be decoded and read.
+    """
+    token = _token(role="service_role")
+    assert "service_role" not in token, "the premise: the string is not there"
+
+    with pytest.raises(ValueError) as exc:
+        A.Config.load(_write_config(tmp_path, token))
+    assert "service_role" in str(exc.value)
+    assert "authenticated" in str(exc.value)
+
+
+def test_token_for_a_different_tenant_is_rejected(tmp_path):
+    """Authenticates perfectly, matches no rows, uploads into nothing."""
+    other = "00000000-0000-4000-8000-000000000001"
+    with pytest.raises(ValueError) as exc:
+        A.Config.load(_write_config(tmp_path, _token(tenant=other)))
+    assert "tenant" in str(exc.value).lower()
+
+
+def test_a_correct_agent_token_loads(tmp_path):
+    cfg = A.Config.load(_write_config(tmp_path, _token()))
+    assert cfg.tenant_id == "57b61b47-a590-49fe-803c-0c174a07b7ec"
+
+
+def test_a_malformed_token_is_rejected_not_ignored(tmp_path):
+    with pytest.raises(ValueError):
+        A.Config.load(_write_config(tmp_path, "not.a.jwt"))
+
+
+# ════════════════════════════════════════════════════════════════
+# 9) 🔴 Day Zero — a fresh install must not pull 218,207 invoices
+# ════════════════════════════════════════════════════════════════
+
+def test_first_run_sets_the_watermark_and_pulls_nothing(paths):
+    """
+    watermark_salid defaults to 0, and 'no backfill' has to mean something
+    in practice: on a fresh install we adopt MAX(salid) and read nothing
+    behind it. Otherwise the first cycle drags the whole history across
+    during service.
+    """
+    client, state = FakeSupa(), A.State()
+    assert state.initialised is False
+
+    code = A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+
+    assert code == A.EXIT_OK
+    assert state.initialised is True
+    assert state.watermark_salid == 1104          # the fixture's MAX(salid)
+    assert client.upserts == [], "nothing may be uploaded on the first run"
+
+
+def test_first_run_dry_run_reports_but_sets_nothing(paths, capsys):
+    state = A.State()
+    A.run_once(CFG, state, paths, fake_adapter, FakeSupa(), NOW, dry_run=True)
+    out = capsys.readouterr().out
+    assert "FIRST RUN" in out
+    assert "1104" in out
+    assert state.initialised is False and state.watermark_salid == 0
+    assert not paths.exists()
+
+
+def test_second_run_after_initialisation_pulls_normally(paths):
+    client = FakeSupa()
+    state = A.State(initialised=True)
+    A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+    assert "invoices" in client.tables_written()
+
+
+# ════════════════════════════════════════════════════════════════
+# 9b) 🔴 a per-cycle ceiling, and a watermark that never overshoots
+# ════════════════════════════════════════════════════════════════
+
+def test_cycle_is_capped_and_the_cap_is_logged(paths, caplog):
+    client = FakeSupa()
+    state = fresh_state()
+    A.MAX_INVOICES_PER_CYCLE = 10
+    try:
+        A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+    finally:
+        A.MAX_INVOICES_PER_CYCLE = 5000
+
+    uploaded = dict((t, n) for t, n in client.upserts)
+    assert uploaded["invoices"] <= 10 + 45, "rescan rows are separate"
+    assert any("cap" in r.message.lower() or "backlog" in r.message.lower()
+               for r in caplog.records), "a persistent backlog must be visible"
+
+
+def test_watermark_never_passes_an_invoice_we_did_not_read(paths):
+    """
+    pull() returns MAX(salid) over the whole table, which includes rows the
+    30-second dirty-read guard deliberately held back. Advancing to that
+    number would step over invoices we never read — the rescan would catch
+    them within 15 minutes, but a report built in between would be short.
+    The watermark follows what was actually pulled.
+    """
+    client = FakeSupa()
+    state = fresh_state()
+    A.MAX_INVOICES_PER_CYCLE = 10
+    try:
+        A.run_once(CFG, state, paths, fake_adapter, client, NOW, False)
+    finally:
+        A.MAX_INVOICES_PER_CYCLE = 5000
+
+    assert state.watermark_salid < 1104, "must not skip the uncapped remainder"
+    assert state.watermark_salid == 1009
+
+
+# ════════════════════════════════════════════════════════════════
+# 9c) 🔴 the acceptance comparison runs inside --dry-run
+# ════════════════════════════════════════════════════════════════
+
+def test_dry_run_compares_against_a_bare_count_and_says_pass(paths, capsys):
+    """Neither SSMS nor sqlcmd exists on that machine."""
+    state = fresh_state()
+    A.run_once(CFG, state, paths, fake_adapter, FakeSupa(), NOW, dry_run=True)
+    out = capsys.readouterr().out
+    assert "SELECT COUNT(*) FROM dbo.Sales" in out
+    assert "VERDICT" in out and "PASS" in out
+
+
+def test_dry_run_aborts_when_the_agent_claims_more_than_the_pos_has(paths,
+                                                                    capsys,
+                                                                    monkeypatch):
+    state = fresh_state()
+    monkeypatch.setattr(fake_adapter, "raw_counts", lambda cn, w: (3, 3))
+    A.run_once(CFG, state, paths, fake_adapter, FakeSupa(), NOW, dry_run=True)
+    out = capsys.readouterr().out
+    assert "ABORT" in out
+
 
 def test_config_rejects_unfilled_placeholders(tmp_path):
     """
