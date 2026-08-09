@@ -1,2 +1,6 @@
 pyodbc>=5.0
 requests>=2.31
+# VERIFY.md step 3 and preflight both run the golden baseline on the
+# customer machine. Without this, step 2 succeeds and step 3 dies with
+# ModuleNotFoundError, standing at the counter.
+pytest>=8.0

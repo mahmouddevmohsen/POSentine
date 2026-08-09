@@ -15,6 +15,34 @@ Time if nothing goes wrong: ~20 minutes. Budget 45.
 
 ---
 
+## 0 — Steps 1–4 in one click
+
+```
+double-click preflight.bat
+```
+
+Steps 1 to 4 are the read-only ones, and they are the ones with the most typing
+in them. `preflight.bat` runs all four: console to UTF-8, Python, dependencies,
+config and the **decoded** token, the golden baseline, then `agent.py --dry-run`.
+
+It **stops at the first failure**, names the step, and says what to do. It writes
+nothing to the POS and nothing to the cloud, so one click carries no risk. It ends
+by printing the dry-run block exactly as the agent produced it, and its own verdict
+under it.
+
+Before anything else it checks every file against `MANIFEST.txt`, so "this machine
+is running the code we verified" is a fact rather than an assumption.
+
+It also stops on one thing this document can only ask you to notice by eye: a dry
+run whose `watermark_salid` is **0** with invoices behind it. The agent prints
+`VERDICT: PASS` on that — see step 5 — and it is wrong. See step 4a.
+
+**Steps 1–4 below are what it runs.** Read them when it stops, or to run a step by
+hand. **Steps 5 onward stay manual** — those involve decisions, and a script should
+not make them.
+
+---
+
 ## 1 — Console and Python
 
 ```powershell
@@ -125,6 +153,10 @@ watching.
 >
 > Most likely cause: a `state.json` left behind from a previous attempt with
 > `"initialised": true` but `"watermark_salid": 0`. Do not edit it yourself.
+>
+> `preflight.bat` stops on this by itself: a `watermark_salid` of 0 with any
+> invoices behind it fails, whatever the VERDICT line says. It is the only check
+> in this document that overrides the agent's own verdict.
 
 Run this step again after step 6 to see the normal block below.
 

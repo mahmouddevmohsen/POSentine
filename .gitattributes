@@ -11,8 +11,10 @@
 *.yml   text eol=lf
 *.json  text eol=lf
 
-# PowerShell is run by Windows; keep CRLF.
+# PowerShell and cmd are run by Windows; keep CRLF. cmd in particular
+# mis-parses labels and multi-line blocks in an LF-only .bat file.
 *.ps1   text eol=crlf
+*.bat   text eol=crlf
 
 *.jpg   binary
 *.png   binary

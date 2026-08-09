@@ -68,7 +68,39 @@ currently makes `TRUNCATE` unreachable.
 
 ## Install / run / verify
 
-To be written at the end of the build. See `VERIFY.md` for the on-site acceptance procedure.
+`VERIFY.md` is the on-site acceptance procedure, steps 1–10. Steps 1–4 are the
+read-only ones and are bundled into `preflight.bat`, which the operator
+double-clicks: console to UTF-8, Python, dependencies, config and the **decoded**
+token, the golden baseline, then `agent.py --dry-run`. It stops at the first
+failure, names the VERIFY.md step, and says what to do. Steps 5 onward stay manual
+because they involve decisions.
+
+The logic lives in `preflight.py`, not in the `.bat` — cmd is a poor language to be
+careful in, and everything in `preflight.py` is covered by `test_preflight.py`.
+
+Two checks there are not in VERIFY.md as anything a script could previously catch:
+
+| Check | Why it exists |
+|---|---|
+| The block is judged, not the exit code | `agent.py --dry-run` exits `0` after printing an `ABORT` block. Exit status is not the verdict. |
+| `watermark_salid = 0` with invoices behind it fails | At watermark 0 the agent's own cross-check compares the whole table against the whole table, agrees with itself, and prints `PASS`. Two identical wrong answers. |
+
+### The folder that goes on the customer machine
+
+```bash
+python make_ship.py     # builds ship/ and ship/MANIFEST.txt
+```
+
+`ship/` is generated, gitignored, and never hand-maintained. A committed second copy
+of `agent.py` is exactly how a customer machine ends up running code that drifted
+from the tests months ago. `MANIFEST.txt` carries a sha256 of every file, and
+`preflight.bat` checks it before it checks anything else.
+
+`config.json` is never bundled. It is placed on the machine separately, by hand.
+
+`ship/` is not complete yet: `install/install_agent.ps1` and `uninstall_agent.ps1`
+do not exist, so it covers VERIFY.md steps 1–6 but not step 7. `make_ship.py` prints
+that in red every time it runs rather than letting the gap go quiet.
 
 ## Baseline check
 

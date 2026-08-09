@@ -19,6 +19,13 @@ Docs/
 # repo; the customer's raw POS data must never land there.
 data UN/
 
+# ── Built artefact — never committed ────────────────────────────
+# ship/ is assembled by make_ship.py from the files in this repository.
+# Committing a second copy of agent.py is precisely how the customer
+# machine ends up running code that drifted from the tests months ago.
+# Rebuild it, do not store it.
+ship/
+
 # ── Python ──────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
