@@ -149,12 +149,29 @@ def task_state() -> tuple[str, str]:
     xml = run(["schtasks.exe", "/Query", "/TN", TASK_NAME, "/XML", "ONE"])
     info = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                 f"Get-ScheduledTask -TaskName '{TASK_NAME}' "
-                "-ErrorAction SilentlyContinue | "
-                "Get-ScheduledTaskInfo | Format-List * ; "
-                f"Get-ScheduledTask -TaskName '{TASK_NAME}' "
-                "-ErrorAction SilentlyContinue | "
-                "Select-Object -ExpandProperty Triggers | Format-List *"])
-    return xml, info
+                "-ErrorAction SilentlyContinue | Get-ScheduledTaskInfo | "
+                "Format-List *"])
+    triggers = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    f"Get-ScheduledTask -TaskName '{TASK_NAME}' "
+                    "-ErrorAction SilentlyContinue | "
+                    "Select-Object -ExpandProperty Triggers | Format-List *"])
+
+    # An empty file and "there is no task" must not look the same. That
+    # ambiguity is the whole failure class this product is built around, so
+    # the branch is here in Python rather than inside a quoted PowerShell
+    # one-liner — the first attempt at that was a parse error, which would
+    # have shipped as a mysteriously empty file.
+    absent = "cannot find the file" in xml.lower() or "error:" in xml.lower()
+    if absent and not info.strip():
+        note = (f"NO TASK NAMED '{TASK_NAME}' IS REGISTERED ON THIS MACHINE.\n"
+                "The agent is not scheduled, so nothing runs by itself.\n"
+                "If the install completed, this is a fault. If it stopped\n"
+                "before Phase D, this is expected.\n")
+        return note, note
+    if not info.strip():
+        info = ("(the scheduler returned nothing and did not say why — check "
+                "whether PowerShell is available on this machine)")
+    return xml, f"{info}\n\n--- triggers ---\n{triggers}"
 
 
 def cloud(config_path: Path) -> str:
