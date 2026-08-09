@@ -826,3 +826,79 @@ def test_config_rejects_a_missing_anon_key(tmp_path):
     with pytest.raises(ValueError) as exc:
         A.Config.load(p)
     assert "supabase_anon_key" in str(exc.value)
+
+
+# ════════════════════════════════════════════════════════════════
+# 13) what breaks when nobody is watching
+# ════════════════════════════════════════════════════════════════
+
+def test_a_corrupt_state_file_does_not_wedge_the_agent_forever(tmp_path, caplog):
+    """🔴 A torn or hand-edited state.json used to raise straight out of
+    main(), every three minutes, forever — no cycle would ever run again,
+    and the file that caused it is one the agent itself writes.
+
+    Recovering is safe because state.json is a cache: reconcile_with_cloud
+    resumes from the cloud watermark and may only initialise when nothing
+    has ever synced on either side.
+    """
+    path = tmp_path / "state.json"
+    path.write_text('{"watermark_salid": 1041, "cycle_ind',  # torn mid-write
+                    encoding="utf-8")
+
+    state = A.State.load(path)
+
+    assert state.watermark_salid == 0
+    assert not state.initialised
+    assert (tmp_path / "state.json.corrupt").exists(), (
+        "the bad file must be kept — it is the only copy of the evidence")
+
+
+def test_a_corrupt_state_file_still_resumes_rather_than_reinitialising(tmp_path):
+    """The dangerous half of the recovery above: an empty local state must
+    never cause the agent to re-adopt MAX(salid) and skip everything the
+    cloud already has."""
+    (tmp_path / "state.json").write_text("{{{not json", encoding="utf-8")
+    state = A.State.load(tmp_path / "state.json")
+
+    client = FakeSupa(cloud_watermark=1041)
+    assert A.reconcile_with_cloud(client, CFG, state) is False, (
+        "an unreadable state.json must not look like a first install")
+    assert state.watermark_salid == 1041
+
+
+def test_a_state_file_holding_the_wrong_shape_is_survived(tmp_path):
+    (tmp_path / "state.json").write_text("[1, 2, 3]", encoding="utf-8")
+    assert A.State.load(tmp_path / "state.json").watermark_salid == 0
+
+
+def test_confirm_flags_a_pos_clock_that_has_drifted(capsys):
+    """🔴 VERIFY.md step 6 has always told the operator that a drift beyond
+    ±300 is listed by --confirm. It was not: drift was printed and never
+    judged, so a till whose clock was hours out printed RESULT: OK.
+
+    Shift boundaries are wall-clock, so a wrong clock puts invoices in the
+    wrong shift — a wrong number that gets believed."""
+    client = ReadbackSupa(beats=[{"at": "2026-08-09T03:00:00Z", "ok": True,
+                                  "drift_seconds": 4000, "rows_pulled": 10,
+                                  "note": None}])
+    assert A.confirm(client, CFG) == A.EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "RESULT: NEEDS ATTENTION" in out
+    assert "4000s away" in out
+
+
+def test_confirm_accepts_a_clock_within_tolerance(capsys):
+    client = ReadbackSupa(beats=[{"at": "2026-08-09T03:00:00Z", "ok": True,
+                                  "drift_seconds": -12, "rows_pulled": 10,
+                                  "note": None}])
+    assert A.confirm(client, CFG) == A.EXIT_OK
+    assert "RESULT: OK" in capsys.readouterr().out
+
+
+def test_confirm_refuses_to_pass_a_heartbeat_with_no_clock_reading(capsys):
+    """A missing reading and a good reading must not look the same."""
+    client = ReadbackSupa(beats=[{"at": "2026-08-09T03:00:00Z", "ok": True,
+                                  "drift_seconds": None, "rows_pulled": 10,
+                                  "note": None}])
+    assert A.confirm(client, CFG) == A.EXIT_ERROR
+    assert "cannot be checked" in capsys.readouterr().out

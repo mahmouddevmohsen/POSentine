@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 import adapter_hdsoft as default_adapter
+import logsetup
 import mint_agent_token
 import rows as R
 import supa
@@ -57,6 +58,11 @@ LOCK_STALE_SECONDS = 15 * 60
 # The backlog drains over subsequent cycles and the cap is logged each time
 # it bites, so a persistent one is visible rather than merely survived.
 MAX_INVOICES_PER_CYCLE = 5000
+
+# What --confirm will accept between the POS clock and ours. VERIFY.md step 6
+# has always quoted ±300; until now nothing enforced it.
+MAX_CLOCK_DRIFT_SECONDS = 300
+
 LOG = logging.getLogger("posentine.agent")
 
 EXIT_OK = 0
@@ -71,31 +77,15 @@ EXIT_HALTED = 3                  # restore suspected / schema drift
 
 def configure_output(log_path: Path | None = None) -> None:
     """
-    Arabic item names on a default Windows console are cp1252, and printing
-    one raises UnicodeEncodeError. That would surface mid-install, on the
-    console of the person deciding whether to trust this.
+    Console and the rolling log file, both masked. See logsetup.py.
 
-    errors='replace' on the console deliberately: garbled output can be
-    read past, a crash during verification cannot.
+    What used to be here was a plain FileHandler with no size limit and no
+    redaction. Two things changed and both are the log's job rather than
+    the caller's: the file is size-capped and rotated, so it cannot fill a
+    till's disk, and every record is passed through a masking formatter, so
+    a credential cannot reach it by someone forgetting.
     """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            reconfigure(encoding="utf-8", errors="replace")
-
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        # The Scheduled Task runs hidden, so this file is the only output
-        # that survives. It is opened UTF-8 explicitly for the same reason.
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-        handlers=handlers,
-        force=True,
-    )
+    logsetup.configure(log_path)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -118,6 +108,17 @@ class Config:
     @staticmethod
     def load(path: Path) -> "Config":
         raw = json.loads(path.read_text(encoding="utf-8"))
+
+        # Registered before any validation, so that even a message about a
+        # malformed config cannot carry the value it is complaining about.
+        # This is the single point where the logger learns what to mask;
+        # every path that reaches a live credential comes through here.
+        unmaskable = logsetup.register_config_secrets(raw)
+        for label in unmaskable:
+            LOG.error("%s is too short to redact from logs. Change it, or "
+                      "treat every log from this machine as carrying it.",
+                      label)
+
         required = ("tenant_id", "source_id", "supabase_url",
                     "supabase_anon_key", "supabase_agent_token", "sql")
         missing = [k for k in required if not raw.get(k)]
@@ -174,13 +175,47 @@ class State:
 
     @staticmethod
     def load(path: Path) -> "State":
+        """Read the local mirror, and survive it being unreadable.
+
+        A torn or hand-edited state.json used to raise straight out of
+        main() — every three minutes, forever, with no cycle ever running
+        again. The agent would have been permanently wedged by a file that
+        is, by design, only a cache.
+
+        Recovering is safe **because** it is only a cache: the cloud is the
+        authority. reconcile_with_cloud() resumes from the higher of the two
+        watermarks and is allowed to initialise only when nothing has ever
+        synced on either side — so starting from an empty State here resumes
+        the install rather than re-adopting MAX(salid) and skipping history.
+
+        The bad file is kept, not deleted. It is evidence, and it is the
+        only copy of whatever went wrong.
+        """
         if not path.exists():
             return State()
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        # JSON object keys are strings; itid lookups are ints.
-        raw["products"] = {int(k): v for k, v in (raw.get("products") or {}).items()}
-        known = {f for f in State().__dict__}
-        return State(**{k: v for k, v in raw.items() if k in known})
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError(f"state.json holds {type(raw).__name__}, "
+                                 "not an object")
+            # JSON object keys are strings; itid lookups are ints.
+            raw["products"] = {int(k): v
+                               for k, v in (raw.get("products") or {}).items()}
+            known = {f for f in State().__dict__}
+            return State(**{k: v for k, v in raw.items() if k in known})
+        except (OSError, ValueError, TypeError) as exc:
+            quarantine = path.with_suffix(path.suffix + ".corrupt")
+            try:
+                os.replace(path, quarantine)
+            except OSError:                             # pragma: no cover
+                quarantine = path
+            LOG.error(
+                "state.json is unreadable (%s: %s). Moved it to %s and "
+                "starting from an empty local state. This is safe: the "
+                "cloud holds the authoritative watermark and the agent "
+                "resumes from it rather than re-initialising. Send us that "
+                "file.", type(exc).__name__, exc, quarantine.name)
+            return State()
 
     def save(self, path: Path) -> None:
         """Atomic: a torn state file would restart the watermark at zero."""
@@ -502,22 +537,29 @@ def upload(client: supa.Supa, cfg: Config, result: CycleResult) -> None:
     Order matters: reference data first so a report built moments later has
     names, then invoices before their lines. Any failure raises, and the
     caller leaves every watermark exactly where it was.
+
+    Each table is logged as it lands. Three weeks later, "the invoices went
+    up and the lines did not" is the difference between a diagnosis and a
+    site visit — and it is exactly what a network drop between two batches
+    looks like.
     """
-    if result.products:
-        client.upsert("pos_products", result.products,
-                      on_conflict="tenant_id,source_id,itid")
-    if result.users:
-        client.upsert("pos_users", result.users,
-                      on_conflict="tenant_id,source_id,uid")
-    if result.invoices:
-        client.upsert("invoices", result.invoices,
-                      on_conflict="tenant_id,source_id,salid")
-    if result.lines:
-        client.upsert("invoice_lines", result.lines,
-                      on_conflict="tenant_id,source_id,saledeid")
-    if result.cash:
-        client.upsert("cash_counts", result.cash,
-                      on_conflict="tenant_id,source_id,srid")
+    landed: list[str] = []
+    for table, payload, conflict in (
+            ("pos_products", result.products, "tenant_id,source_id,itid"),
+            ("pos_users", result.users, "tenant_id,source_id,uid"),
+            ("invoices", result.invoices, "tenant_id,source_id,salid"),
+            ("invoice_lines", result.lines, "tenant_id,source_id,saledeid"),
+            ("cash_counts", result.cash, "tenant_id,source_id,srid")):
+        if not payload:
+            continue
+        try:
+            client.upsert(table, payload, on_conflict=conflict)
+        except Exception:
+            LOG.error("upload stopped at %s (%d rows). Landed before it: %s",
+                      table, len(payload), ", ".join(landed) or "nothing")
+            raise
+        landed.append(f"{table}={len(payload)}")
+    LOG.info("upload ok  %s", "  ".join(landed) or "nothing to upload")
 
 
 def advance_sync_state(client: supa.Supa, cfg: Config, state: State,
@@ -802,6 +844,26 @@ def confirm(client: supa.Supa, cfg: Config, out=None) -> int:
     elif not beats[0].get("ok"):
         problems.append("the most recent heartbeat is not ok — read its note")
 
+    # VERIFY.md step 6 tells the operator that a drift beyond ±300 is listed
+    # here and what to do about it. It was not: drift was printed and never
+    # judged, so a till whose clock is hours out produced RESULT: OK. Every
+    # shift boundary is wall-clock (07:00/19:00 local), so a wrong clock puts
+    # invoices in the wrong shift and the totals are confidently incorrect —
+    # which is the one failure this product exists to prevent.
+    if beats:
+        drift = beats[0].get("drift_seconds")
+        if drift is None:
+            problems.append(
+                "the newest heartbeat carries no clock reading, so the POS "
+                "clock cannot be checked. Every shift boundary depends on it.")
+        elif abs(int(drift)) > MAX_CLOCK_DRIFT_SECONDS:
+            problems.append(
+                f"the POS clock is {int(drift)}s away from ours (limit "
+                f"±{MAX_CLOCK_DRIFT_SECONDS}). Shift boundaries are wall-clock, "
+                "so invoices would land in the wrong shift and every total "
+                "would be wrong rather than absent. Fix the machine clock "
+                "and run this again.")
+
     if null_price:
         problems.append(
             f"{null_price} line(s) have no list_price. Zero-invoice detection "
@@ -834,10 +896,43 @@ def confirm(client: supa.Supa, cfg: Config, out=None) -> int:
 # entry point
 # ════════════════════════════════════════════════════════════════
 
+def _log_what_was_read(result: CycleResult, state: State) -> None:
+    """One line for what the POS gave us, and one for what we chose not to
+    take. The second is the one that answers questions later: "the agent
+    read 12 invoices" and "the agent read 12 of 4,000 invoices" look
+    identical without it.
+    """
+    pulled = result.pull
+    LOG.info("pull ok    new_invoices=%d new_lines=%d rescan_invoices=%d "
+             "rescan_lines=%d cash=%d products=%d pos_clock=%s pos_max_salid=%d",
+             result.new_invoice_count, len(pulled.new_lines),
+             len(pulled.rescanned_invoices), len(pulled.rescanned_lines),
+             len(pulled.cash_counts), len(pulled.products),
+             pulled.pos_clock, pulled.max_salid)
+
+    held_back = pulled.max_salid - result.watermark_target
+    if held_back > 0:
+        reason = ("the per-cycle ceiling — a backlog is draining"
+                  if result.capped else
+                  f"the {default_adapter.DIRTY_READ_GUARD_SECONDS}s dirty-read "
+                  "guard; they follow next cycle")
+        LOG.info("held back  salid %d..%d not read this cycle: %s",
+                 result.watermark_target + 1, pulled.max_salid, reason)
+    if result.unknown_itids:
+        LOG.warning("skipped prices for %d unseen item(s) %s — their lines "
+                    "upload with list_price NULL, never 0, so zero-invoice "
+                    "detection cannot silently lose them",
+                    len(result.unknown_itids), result.unknown_itids[:20])
+
+
 def run_once(cfg: Config, state: State, state_path: Path, adapter,
              client: supa.Supa | None, now_utc: _dt.datetime,
              dry_run: bool) -> int:
     agent_version = getattr(adapter, "AGENT_VERSION", "unknown")
+    started = time.monotonic()
+    LOG.info("cycle %d %s watermark=%d rescan_from=%d agent=%s",
+             state.cycle_index, "dry-run" if dry_run else "start",
+             state.watermark_salid, state.rescan_from_salid, agent_version)
 
     if state.restore_suspected:
         LOG.error("halted: a restore is suspected. salid moved backwards, so "
@@ -887,6 +982,7 @@ def run_once(cfg: Config, state: State, state_path: Path, adapter,
             return EXIT_OK
 
         result = build_cycle(adapter, cn, cfg, state, now_utc)
+        _log_what_was_read(result, state)
         if dry_run:
             result.raw_counts = _raw_counts(adapter, cn,      # type: ignore[attr-defined]
                                             state.watermark_salid)
@@ -905,7 +1001,12 @@ def run_once(cfg: Config, state: State, state_path: Path, adapter,
             state.save(state_path)
         return EXIT_HALTED
     except Exception as exc:
-        LOG.exception("cycle failed before upload: %s", exc)
+        # The type name is on the line, not only inside the traceback: a
+        # pyodbc.OperationalError and a requests.ConnectionError need
+        # different people to look at them, and three weeks later the
+        # difference has to be greppable.
+        LOG.exception("cycle failed before upload [%s]: %s",
+                      type(exc).__name__, exc)
         if not dry_run and client is not None:
             _beat_failure(client, cfg, "pull_failed", str(exc), agent_version)
         return EXIT_ERROR
@@ -930,13 +1031,15 @@ def run_once(cfg: Config, state: State, state_path: Path, adapter,
     except Exception as exc:
         # No watermark moves. Nothing is lost — the same range is re-read
         # in three minutes.
-        LOG.exception("upload failed, watermark held at %d: %s",
-                      state.watermark_salid, exc)
+        LOG.exception("upload failed [%s], watermark HELD at %d (nothing is "
+                      "lost; the same range is re-read next cycle): %s",
+                      type(exc).__name__, state.watermark_salid, exc)
         _beat_failure(client, cfg, "upload_failed", str(exc), agent_version)
         return EXIT_ERROR
 
     # The local mirror follows the same rule as the remote write: what we
     # actually read, never MAX(salid) over the table.
+    watermark_before = state.watermark_salid
     state.watermark_salid = result.watermark_target
     state.watermark_saledeid = pulled.max_saledeid
     state.last_date_change_rows = pulled.date_change_rows
@@ -949,8 +1052,11 @@ def run_once(cfg: Config, state: State, state_path: Path, adapter,
 
     send_heartbeats(client, cfg, result, pulled.pos_clock, drift,
                     rows_pulled, True, None, agent_version)
-    LOG.info("cycle ok — %d invoices, %d lines, watermark now %d",
-             len(result.invoices), len(result.lines), state.watermark_salid)
+    LOG.info("cycle %d ok  watermark %d -> %d  invoices=%d lines=%d "
+             "drift=%ss elapsed=%.1fs",
+             state.cycle_index - 1, watermark_before, state.watermark_salid,
+             len(result.invoices), len(result.lines), drift,
+             time.monotonic() - started)
     return EXIT_OK
 
 
@@ -967,9 +1073,15 @@ def _halt(client: supa.Supa, cfg: Config, kind: str, detail: str,
 def _beat_failure(client: supa.Supa, cfg: Config, kind: str, detail: str,
                   agent_version: str) -> None:
     try:
+        # Masked before it leaves the machine, not only before it reaches
+        # the log file. A driver error can quote a connection string, and
+        # this text is stored in the cloud and read back by --confirm.
+        # Masked first, then truncated: truncating first can cut a token in
+        # half, and half a token is as leaked as all of it.
+        safe = logsetup.mask(detail)[:500]
         client.insert("heartbeats", [R.heartbeat_payload(
             cfg.tenant_id, cfg.source_id, agent_version, None, None, 0, False,
-            R.anomaly_note(kind, {"message": detail[:500]}, agent_version))],
+            R.anomaly_note(kind, {"message": safe}, agent_version))],
             returning=False)
     except Exception:                               # pragma: no cover
         LOG.exception("could not record the failure heartbeat either")
@@ -1028,8 +1140,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             with SingleInstanceLock(args.state.with_suffix(".lock")) as lock:
                 if not lock.may_run:
-                    LOG.info("another cycle is running; exiting quietly")
+                    LOG.info("another cycle is still running; exiting quietly. "
+                             "The task fires again in %ds.", cfg.sync_seconds)
                     return EXIT_ANOTHER_INSTANCE
+                if lock.took_over:
+                    LOG.warning("proceeding despite a held lock — the holder "
+                                "looked hung. Two cycles may overlap; every "
+                                "upload is an idempotent upsert and every "
+                                "sync_state write is monotonic, so overlap "
+                                "costs duplicate work, not wrong data.")
                 code = run_once(cfg, state, args.state, adapter, client,
                                 _dt.datetime.now(_dt.timezone.utc), False)
 

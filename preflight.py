@@ -59,6 +59,7 @@ RULE = "─" * 66
 STEP_1 = "1 — console and Python"
 STEP_2 = "2 — dependencies"
 STEP_3 = "3 — config and token"
+STEP_3B = "3b — read-only proof (attempts to write, requires refusal)"
 STEP_4 = "4 — dry run (reads only, writes nothing anywhere)"
 
 # The block headings agent.py prints. Matched literally: a heading that
@@ -399,6 +400,7 @@ def step_3_config(config_name: str = "config.json") -> None:
        f"{cfg.sql['database']}")
 
     step_3_golden()
+    return cfg
 
 
 def step_3_golden() -> None:
@@ -425,6 +427,90 @@ def step_3_golden() -> None:
                    "The test file on this machine is not the one we verified.\n"
                    "    Re-copy the ship folder. Do not continue.")
     ok(f"golden baseline: {expected}")
+
+
+# ════════════════════════════════════════════════════════════════
+# step 3b — the read-only proof
+# ════════════════════════════════════════════════════════════════
+
+def step_3b_readonly_proof(cfg):
+    """Attempt to write to the POS, and require every attempt to be refused.
+
+    This is the first thing that touches the customer's database, and it is
+    deliberately not a read. We told this customer their POS will not be
+    written to; that promise is worth exactly as much as the last time we
+    checked it, so it is checked on every install rather than once.
+
+    It cannot run any earlier than this: connecting needs pyodbc from step 2
+    and the credentials from step 3. It runs before step 4 — before the
+    agent reads a single invoice — and it aborts the whole install if any
+    write is permitted.
+
+    The probes change nothing even if they are wrongly allowed: every one
+    carries `WHERE 1 = 0`. The verbs with no harmless form — TRUNCATE, ALTER
+    — are asked about rather than attempted. See readonly_probe.py.
+    """
+    heading(STEP_3B)
+    note("attempting UPDATE, DELETE and INSERT against the POS database.")
+    note("every one must be refused. nothing is changed either way:")
+    note("every probe carries WHERE 1 = 0.")
+    print()
+
+    importlib.invalidate_caches()
+    try:
+        adapter = importlib.import_module("adapter_hdsoft")
+        probe = importlib.import_module("readonly_probe")
+    except ImportError as exc:
+        raise Stop(STEP_3B, f"cannot load the probe modules: {exc}",
+                   "Re-copy the ship folder and run this again.")
+
+    try:
+        cn = adapter.connect(**cfg.sql)
+    except Exception as exc:                            # noqa: BLE001
+        # Same symptom table as step 4 — a connection failure here reads
+        # exactly like a connection failure there.
+        guidance = next((do for mark, do in STEP_4_SYMPTOMS
+                         if mark in str(exc)), None)
+        raise Stop(STEP_3B, f"could not connect to the POS database: {exc}",
+                   guidance or ("Check the sql block in config.json against the\n"
+                                "    machine's actual SQL Server instance name.\n"
+                                "    Photograph this and call."))
+
+    try:
+        report = probe.run(cn)
+    finally:
+        try:
+            cn.close()
+        except Exception:                               # pragma: no cover
+            pass
+
+    # Printed whole, pass or fail. This block is the evidence we show the
+    # customer, so it belongs in the transcript either way.
+    print(probe.format_report(report))
+
+    if not report.passed:
+        raise Stop(
+            STEP_3B,
+            "this login can write to the POS database"
+            if report.permitted else
+            "could not establish that the POS refuses our writes",
+            "STOP. Do not install. These credentials are not read-only, and\n"
+            "    read-only on the POS is the one promise this product makes\n"
+            "    that is not negotiable.\n"
+            "    Photograph the block above - it names exactly which\n"
+            "    permission is wrong - change nothing, and call.")
+
+    ok("every write was refused by the POS; no altering permission is held")
+    if not report.guard_wired:
+        # Loud rather than absent: the choke point is a two-line diff into a
+        # locked file, and "nobody applied it yet" must not look the same as
+        # "it is protecting you".
+        note("")
+        note("⚠ the sqlguard choke point is NOT wired into adapter_hdsoft.py.")
+        note("  The server still refuses us - that is what the block above")
+        note("  proves - but our own code is not yet refusing itself.")
+        note("  See READONLY_GUARANTEE.md, layer 3.")
+    return report
 
 
 # ════════════════════════════════════════════════════════════════
@@ -511,7 +597,9 @@ def classify_dry_run(text: str) -> tuple[bool, str, str]:
             "    this as a pass. Photograph the block and call.")
 
 
-def step_4_dry_run() -> None:
+def step_4_dry_run() -> str:
+    """Returns the captured block, so a caller can tell a first install from
+    a resuming one without running the agent a second time."""
     heading(STEP_4)
     note("running: python agent.py --dry-run")
     note("this reads the POS and the cloud. It writes to neither.")
@@ -540,6 +628,7 @@ def step_4_dry_run() -> None:
     note("")
     for line in do.splitlines():
         note(line.strip())
+    return out
 
 
 # ════════════════════════════════════════════════════════════════
@@ -565,6 +654,45 @@ def report_stop(stop: Stop) -> None:
     print("=" * 66)
 
 
+class PhaseA:
+    """What steps 0–4 established, for whoever runs them.
+
+    `installer.py` needs two facts out of preflight that a person reading
+    the screen gets for free: whether this is a first install, and whether
+    the read-only proof passed. Returning them here is what stops the
+    installer from re-deriving either — a second implementation of the
+    gate is a second thing that can disagree with the first.
+    """
+
+    def __init__(self, integrity: str, dry_run: str, readonly_report,
+                 config=None) -> None:
+        self.integrity = integrity
+        self.dry_run = dry_run
+        self.readonly_report = readonly_report
+        self.config = config
+
+    @property
+    def is_first_install(self) -> bool:
+        return FIRST_RUN_MARK in self.dry_run
+
+
+def run_steps_0_to_4(config_name: str = "config.json",
+                     skip_install: bool = False) -> PhaseA:
+    """Steps 0–4, in order, stopping at the first failure.
+
+    One implementation, two callers: `preflight.main` for our own use and
+    `installer.py` Phase A for the one-click path. They cannot drift.
+    """
+    integrity = verify_manifest(HERE)
+    print(f"  {integrity}")
+
+    step_1_python()
+    step_2_dependencies(skip_install)
+    cfg = step_3_config(config_name)
+    report = step_3b_readonly_proof(cfg)
+    return PhaseA(integrity, step_4_dry_run(), report, cfg)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Run VERIFY.md steps 1–4. Reads only; writes nothing "
@@ -579,18 +707,15 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 66)
     print("  POSentine preflight — VERIFY.md steps 1 to 4")
     print("=" * 66)
-    print("  Reads only. Nothing here writes to the POS or to the cloud.")
+    print("  Nothing here writes to the POS or to the cloud. Step 3b does")
+    print("  attempt to write to the POS on purpose, and requires every")
+    print("  attempt to be refused; each probe carries WHERE 1 = 0.")
     print("  It stops at the first failure and tells you which step failed.")
     print(f"  Folder: {HERE}")
 
+    integrity = "code integrity   NOT VERIFIED — preflight stopped early"
     try:
-        integrity = verify_manifest(HERE)
-        print(f"  {integrity}")
-
-        step_1_python()
-        step_2_dependencies(args.skip_install)
-        step_3_config(args.config)
-        step_4_dry_run()
+        integrity = run_steps_0_to_4(args.config, args.skip_install).integrity
     except Stop as stop:
         report_stop(stop)
         return 1
@@ -600,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  VERIFY.md steps 1–4 PASSED")
     print("=" * 66)
     print(f"  {integrity}")
+    print("  read-only proof  OK — the POS refused every write we attempted")
     print()
     print("  Steps 5 onward are manual, on purpose — they involve decisions.")
     print("  Step 5 is the verdict you just read. Step 6 is the first write.")

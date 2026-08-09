@@ -15,7 +15,43 @@ Time if nothing goes wrong: ~20 minutes. Budget 45.
 
 ---
 
-## 0 — Steps 1–4 in one click
+## 0 — The whole thing in one click
+
+```
+double-click INSTALL.bat
+```
+
+This runs **steps 1 to 8** as gated phases and stops at the first one that
+fails. Every gate below stays exactly where it is; what changes is who
+enforces it. A person under pressure might look at a delta of 7 and carry
+on. `INSTALL.bat` will not.
+
+| Phase | What | Gate |
+| --- | --- | --- |
+| A | preflight, steps 1–4, plus the read-only proof | verdict must be **PASS** or **FIRST RUN** |
+| B | one real cycle (step 6) | |
+| C | `--confirm` (step 6) | **RESULT: OK** |
+| D | register the scheduled task (step 7) | rolls back on failure |
+| E | wait for the task to fire **by itself**, prove a **new** heartbeat | |
+| F | summary: what happened, what runs now, where the logs are |
+
+It takes about 10 minutes, most of it Phase E waiting. **That wait is the
+point.** Everything before it proves a human can run the agent by hand;
+only a new heartbeat from a cycle nobody started proves the machine keeps
+working after you leave.
+
+**Safe to run twice.** Run it again if you are not sure it worked.
+
+If it stops, the screen is unmissable and says what failed, which step,
+what to do, what state the machine is in, and where the log is. Photograph
+it and call.
+
+The rest of this document is what it runs, and how to run any step by
+hand. **Read on when it stops.**
+
+---
+
+## 0b — Steps 1–4 only
 
 ```
 double-click preflight.bat
@@ -112,6 +148,55 @@ appears, and that check returns "safe" for an actual service_role key.
 | `not a readable JWT` | The field was truncated or mangled on the way in. |
 
 **STOP IF:** not `31 passed` → this machine has different code than we verified.
+
+---
+
+## 3b — The read-only proof (attempts to write, and requires refusal)
+
+This is the first thing that touches the POS database, and it is
+deliberately **not** a read.
+
+We have told this customer their POS will not be written to. That promise
+is worth exactly as much as the last time we checked it, so it is checked
+on **every install** — permissions drift, and someone helpful "fixes" a
+login.
+
+`preflight.bat` and `INSTALL.bat` both run it. By hand:
+
+```powershell
+python preflight.py --skip-install
+```
+
+It attempts `UPDATE`, `DELETE` and `INSERT` against `dbo.Sales`,
+`dbo.SalesDe` and `dbo.Items`, and requires **every one** to be refused.
+Every probe carries `WHERE 1 = 0`, so a probe that is wrongly permitted
+still changes nothing.
+
+`TRUNCATE` and `ALTER` are **asked about, never attempted** — `TRUNCATE`
+takes no `WHERE` clause, so a permitted probe would empty the customer's
+sales history. `TRUNCATE` requires `ALTER` on the table, so asking "can
+this login `ALTER dbo.Sales`" is the same question with no risk attached.
+
+Expect the block to end:
+
+```text
+  VERDICT: READ-ONLY CONFIRMED
+```
+
+**STOP IF anything else.** The block names exactly which permission is
+wrong. These credentials can change the customer's database, which is the
+one promise this product makes that is not negotiable.
+
+| Line | Meaning | Do |
+| --- | --- | --- |
+| `PERMITTED` on any probe | The login can write to the POS | **STOP. Do not install. Call.** |
+| `HELD !!` on `ALTER` | The login could empty a table with `TRUNCATE` | **STOP. Call.** |
+| `member of sysadmin` | Permission checks are skipped entirely; every other line above is meaningless | **STOP. Call.** |
+| `INCONCLUSIVE` / `UNKNOWN` | We could not establish refusal. Not a pass. | **STOP. Call.** |
+
+The full block goes into the install transcript and the diagnostics zip.
+**That transcript is our evidence to the customer.** See
+`READONLY_GUARANTEE.md`.
 
 ---
 
@@ -310,6 +395,24 @@ Get-Content C:\thirdeyev\agent.log -Tail 20
 ```
 
 Expect `cycle ok` lines and no tracebacks.
+
+The log is size-capped and rotated — `agent.log` plus up to five older
+copies, 12 MB in total, so it can never fill the till's disk. It contains
+no password and no token: every record passes through a masking formatter
+on its way out, rather than depending on whoever wrote the line.
+
+### If anything looks wrong, now or in three weeks
+
+```
+double-click collect_diagnostics.bat
+```
+
+One zip, next to the agent: install transcripts, agent logs, versions,
+ODBC drivers, the scheduled task, `state.json`, what is in the cloud, the
+manifest check, and a freshly re-run read-only proof. **No secrets** —
+`config.json` is not included, only a redacted copy.
+
+Send that one file. It replaces the conversation.
 
 Tell the owner **no messages will arrive yet**. Detection is running; sending stays off
 until we enable it deliberately in step 9, which is not done on this visit.

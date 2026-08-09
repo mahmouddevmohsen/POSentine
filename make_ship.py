@@ -57,6 +57,12 @@ SHIPPED: tuple[tuple[str, str], ...] = (
     ("rows.py", "POS rows to upload payloads"),
     ("supa.py", "Supabase REST client"),
     ("mint_agent_token.py", "imported by agent.py to decode and check the token"),
+    ("logsetup.py", "log rotation and secret masking; imported by agent.py"),
+
+    # ── read-only, enforced rather than promised ────────────────
+    ("sqlguard.py", "refuses any statement that is not a read"),
+    ("readonly_probe.py", "attempts writes on site and requires refusal"),
+    ("READONLY_GUARANTEE.md", "what we promise about the POS, and what enforces it"),
 
     # ── the baseline, run on site by VERIFY.md step 3 ───────────
     ("test_golden.py", "31 golden tests — proves this machine's code is ours"),
@@ -65,6 +71,10 @@ SHIPPED: tuple[tuple[str, str], ...] = (
     ("report.py", "imported by test_golden.py"),
 
     # ── what the operator touches ───────────────────────────────
+    ("INSTALL.bat", "double-click: the whole install, VERIFY.md steps 1-8"),
+    ("installer.py", "the phases and gates INSTALL.bat runs"),
+    ("collect_diagnostics.bat", "double-click: one zip, no secrets"),
+    ("collect_diagnostics.py", "what collect_diagnostics.bat runs"),
     ("preflight.bat", "double-click: VERIFY.md steps 1-4"),
     ("preflight.py", "the checks preflight.bat runs"),
     ("VERIFY.md", "the acceptance procedure, steps 1-10"),

@@ -74,7 +74,7 @@ def arguments(task_xml) -> str:
 
 @requires_powershell
 def test_it_repeats_every_three_minutes(task_xml):
-    interval = task_xml.find(".//t:LogonTrigger/t:Repetition/t:Interval", NS)
+    interval = task_xml.find(".//t:TimeTrigger/t:Repetition/t:Interval", NS)
     assert interval is not None
     assert interval.text == "PT3M"
 
@@ -83,18 +83,55 @@ def test_it_repeats_every_three_minutes(task_xml):
 def test_the_repetition_never_ends(task_xml):
     """A <Duration> is how "every 3 minutes" quietly becomes "for a day".
     Absent means indefinite, by definition of the schema."""
-    repetition = task_xml.find(".//t:LogonTrigger/t:Repetition", NS)
+    repetition = task_xml.find(".//t:TimeTrigger/t:Repetition", NS)
     assert repetition is not None
     assert repetition.find("t:Duration", NS) is None
     assert repetition.find("t:StopAtDurationEnd", NS).text == "false"
 
 
 @requires_powershell
-def test_it_triggers_at_logon(task_xml):
-    trigger = task_xml.find(".//t:Triggers/t:LogonTrigger", NS)
-    assert trigger is not None
-    assert trigger.find("t:Enabled", NS).text == "true"
-    assert len(task_xml.findall(".//t:Triggers/*", NS)) == 1
+def test_the_repetition_is_not_on_the_logon_trigger(task_xml):
+    """🔴 The one that was wrong, and cost nothing only because it was
+    measured before the visit.
+
+    A logon trigger fires on a logon *event*. Registering it while the till
+    user is already logged on does not produce one, and a repetition hangs
+    off its trigger — so the task sits there, enabled and correct-looking,
+    and runs zero times. Measured on 2026-08-09, no logoff, over 4 minutes:
+
+        LogonTrigger fired 0 times      NextRunTime = (empty)
+        TimeTrigger  fired 4 times      NextRunTime = 18:42:42
+
+    LastTaskResult was 267011 — SCHED_S_TASK_HAS_NOT_RUN. On a till that
+    stays logged in for weeks, the agent would never have run at all.
+    """
+    logon = task_xml.find(".//t:Triggers/t:LogonTrigger", NS)
+    assert logon is not None, "a reboot should still start a cycle promptly"
+    assert logon.find("t:Repetition", NS) is None, (
+        "the repetition is on the logon trigger again — that task never runs "
+        "while the user is already logged on")
+
+
+@requires_powershell
+def test_it_starts_without_waiting_for_a_logon(task_xml):
+    """The start boundary is in the past, so the task is due the moment it
+    is registered. Phase E of the installer waits for a run; without this
+    it would be waiting for someone to log out and back in."""
+    import datetime as dt
+
+    start = task_xml.find(".//t:TimeTrigger/t:StartBoundary", NS)
+    assert start is not None and start.text
+    boundary = dt.datetime.strptime(start.text, "%Y-%m-%dT%H:%M:%S")
+    assert boundary <= dt.datetime.now() + dt.timedelta(seconds=90), (
+        f"start boundary {boundary} is in the future; the first run would wait")
+
+
+@requires_powershell
+def test_exactly_one_trigger_repeats(task_xml):
+    """Two repeating triggers would fire at different offsets and compete."""
+    repeating = [t for t in task_xml.findall(".//t:Triggers/*", NS)
+                 if t.find("t:Repetition", NS) is not None]
+    assert len(repeating) == 1, [t.tag for t in repeating]
 
 
 # ════════════════════════════════════════════════════════════════

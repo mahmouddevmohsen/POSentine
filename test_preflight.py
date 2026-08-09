@@ -343,14 +343,23 @@ def test_everything_the_agent_imports_is_shipped():
 
 
 def _local_imports(path):
-    """Repository modules a file imports **at module level**.
+    """Repository modules a file imports at module level, plus every module
+    it names in an `importlib.import_module("literal")` call.
 
-    Module level only, deliberately. Those resolve the moment the file is
-    loaded, so a missing one is an ImportError before the agent does
-    anything. An import inside a function is reachable surface, not startup
-    surface — `agent.py` imports `fake_adapter` that way, under `--fake`,
-    and that module is excluded from ship/ on purpose: synthetic data has no
-    place on a production machine.
+    Module-level imports resolve the moment the file is loaded, so a missing
+    one is an ImportError before the agent does anything. An import inside a
+    function is reachable surface, not startup surface — `agent.py` imports
+    `fake_adapter` that way, under `--fake`, and that module is excluded
+    from ship/ on purpose: synthetic data has no place on a production
+    machine.
+
+    `importlib.import_module` is included wherever it appears, at any depth,
+    because preflight.py loads `agent`, `mint_agent_token`, `adapter_hdsoft`
+    and `readonly_probe` that way — deliberately late, after step 2 has
+    installed their dependencies. Those are invisible to an import walk and
+    would fail at the counter rather than here. This was a real gap: the
+    module-level walk passed a ship list that had no `readonly_probe.py`
+    in it.
     """
     import ast
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -360,6 +369,19 @@ def _local_imports(path):
             names |= {alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             names.add(node.module.split(".")[0])
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        is_import_module = (
+            (isinstance(target, ast.Attribute) and target.attr == "import_module")
+            or (isinstance(target, ast.Name) and target.id == "import_module"))
+        if is_import_module and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                names.add(first.value.split(".")[0])
+
     return {n for n in names if (P.HERE / f"{n}.py").exists()}
 
 

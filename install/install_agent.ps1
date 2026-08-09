@@ -53,6 +53,11 @@ $ErrorActionPreference = 'Stop'
 $MinPythonMajor = 3
 $MinPythonMinor = 11
 
+# What Fail prints about the state of the machine. It starts as the truth
+# before anything is registered, and the rollback path rewrites it. A stop
+# message that is wrong about what it left behind is worse than no message.
+$script:StateNote = 'No task was registered. Nothing was written to the POS or the cloud.'
+
 function Fail([string]$What, [string]$Do) {
     Write-Host ''
     Write-Host ('=' * 66)
@@ -65,9 +70,71 @@ function Fail([string]$What, [string]$Do) {
     Write-Host '  What to do:'
     foreach ($line in ($Do -split "`n")) { Write-Host ('    ' + $line.Trim()) }
     Write-Host ''
-    Write-Host '  No task was registered. Nothing was written to the POS or the cloud.'
+    foreach ($line in ($script:StateNote -split "`n")) { Write-Host ('  ' + $line.Trim()) }
     Write-Host ('=' * 66)
     exit 1
+}
+
+function Get-PriorXml {
+    <#
+        A copy of the task as it stands, so a failure after registration can
+        put it back. Export-ScheduledTask is Windows 8+; the customer machine
+        runs SQL Server 2014 Express and may be older, so schtasks - which has
+        existed since XP - is the fallback rather than the afterthought.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Name)
+    try {
+        $exported = Export-ScheduledTask -TaskName $Name -ErrorAction Stop
+        if ($exported) { return ($exported | Out-String) }
+    }
+    catch { }
+    try {
+        $raw = & schtasks.exe /Query /TN $Name /XML ONE 2>$null
+        if ($LASTEXITCODE -eq 0 -and $raw) { return ($raw | Out-String) }
+    }
+    catch { }
+    return $null
+}
+
+function Restore-Prior {
+    <#
+        Undo. Returns $true when the machine is back where it started.
+        $null prior XML means there was no task before, so removing ours is
+        the restoration.
+    #>
+    param([string]$Name, [string]$Xml)
+    if ([string]::IsNullOrWhiteSpace($Xml)) {
+        try {
+            Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction Stop
+            return (-not (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue))
+        }
+        catch { return $false }
+    }
+    try {
+        $null = Register-ScheduledTask -TaskName $Name -Xml $Xml -Force -ErrorAction Stop
+        return $true
+    }
+    catch { return $false }
+}
+
+function FailAndRollBack([string]$Name, [string]$Xml, [string]$What, [string]$Do) {
+    $restored = Restore-Prior -Name $Name -Xml $Xml
+    if ($restored) {
+        $script:StateNote = if ([string]::IsNullOrWhiteSpace($Xml)) {
+            "Rolled back: the task was removed again. This machine is exactly as`n" +
+            'it was before this script ran. Nothing was written to the POS or the cloud.'
+        } else {
+            "Rolled back: the task that was here before has been put back exactly`n" +
+            'as it was. Nothing was written to the POS or the cloud.'
+        }
+    } else {
+        $script:StateNote =
+            "!! COULD NOT ROLL BACK. A task named '$Name' may be registered and is`n" +
+            "!! NOT the one we verified. Do not leave the machine like this.`n" +
+            "!! Run: powershell -ExecutionPolicy Bypass -File .\install\uninstall_agent.ps1`n" +
+            '!! then photograph this screen and call.'
+    }
+    Fail $What $Do
 }
 
 function Get-TaskXml {
@@ -75,12 +142,39 @@ function Get-TaskXml {
         Built as a string rather than through the cmdlets so that what is
         registered is visible before it is registered, and identical on
         every Windows version.
+
+        ---- why the repetition is on a TimeTrigger ----------------
+        It used to be on the LogonTrigger, and that task NEVER RAN.
+
+        A logon trigger fires on a logon *event*. Registering it while the
+        user is already logged on does not produce one, and the repetition
+        hangs off the trigger, so nothing repeats either. Measured on this
+        machine, registered while logged on, no logoff:
+
+            t+1m  LogonTrigger fired 0 time(s)   TimeTrigger fired 1
+            t+2m  LogonTrigger fired 0 time(s)   TimeTrigger fired 2
+            t+3m  LogonTrigger fired 0 time(s)   TimeTrigger fired 3
+            t+4m  LogonTrigger fired 0 time(s)   TimeTrigger fired 4
+
+            pos_probe_logon  LastRunTime=11/30/1999  LastTaskResult=267011
+                             NextRunTime=            <- not even scheduled
+            pos_probe_time   LastRunTime=6:35:35 PM  LastTaskResult=0
+
+        267011 is SCHED_S_TASK_HAS_NOT_RUN. On a till that stays logged in
+        for weeks the agent would have run zero times after we left, with
+        a correctly registered task sitting there looking healthy.
+
+        So: the TimeTrigger carries the repetition and starts at install
+        time, and the LogonTrigger stays - without a repetition - purely so
+        a cycle runs promptly after a reboot instead of waiting up to three
+        minutes. One repetition, one job each, nothing competing.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$UserId,
-        [Parameter(Mandatory = $true)][string]$Name
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$StartBoundary
     )
 
     $wrapper = Join-Path (Join-Path $Root 'install') 'run_agent.ps1'
@@ -91,10 +185,11 @@ function Get-TaskXml {
     # a folder name would otherwise produce XML the scheduler rejects with
     # a parse error nobody would connect to the folder it was installed
     # into. .NET's own escaper rather than a hand-rolled one.
-    $eName = [System.Security.SecurityElement]::Escape($Name)
-    $eUser = [System.Security.SecurityElement]::Escape($UserId)
-    $eArgs = [System.Security.SecurityElement]::Escape($arguments)
-    $eRoot = [System.Security.SecurityElement]::Escape($Root)
+    $eName  = [System.Security.SecurityElement]::Escape($Name)
+    $eUser  = [System.Security.SecurityElement]::Escape($UserId)
+    $eArgs  = [System.Security.SecurityElement]::Escape($arguments)
+    $eRoot  = [System.Security.SecurityElement]::Escape($Root)
+    $eStart = [System.Security.SecurityElement]::Escape($StartBoundary)
 
     @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -104,13 +199,17 @@ function Get-TaskXml {
     <URI>\$eName</URI>
   </RegistrationInfo>
   <Triggers>
-    <LogonTrigger>
+    <TimeTrigger>
       <Enabled>true</Enabled>
-      <UserId>$eUser</UserId>
+      <StartBoundary>$eStart</StartBoundary>
       <Repetition>
         <Interval>PT3M</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
+    </TimeTrigger>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>$eUser</UserId>
     </LogonTrigger>
   </Triggers>
   <Principals>
@@ -226,7 +325,14 @@ $userId = $env:USERDOMAIN + '\' + $env:USERNAME
 Write-Host ('  [ OK ] principal   ' + $userId +
             ' (user-level, LeastPrivilege - not SYSTEM)')
 
-$xml = Get-TaskXml -Root $root -PythonPath $Python -UserId $userId -Name $TaskName
+# Seconds are truncated so the first repetition lands on a whole minute.
+# A start boundary in the past is deliberate: the task is due the moment it
+# is registered, which is what makes Phase E of the installer able to wait
+# for a run rather than for a logon.
+$startBoundary = (Get-Date).ToString('yyyy-MM-ddTHH:mm:00')
+
+$xml = Get-TaskXml -Root $root -PythonPath $Python -UserId $userId `
+                   -Name $TaskName -StartBoundary $startBoundary
 
 if ($ShowXml) {
     Write-Host ''
@@ -240,9 +346,21 @@ if ($ShowXml) {
 # register
 # ============================================================
 
+# ---- snapshot first, so anything after this is reversible ----
+$priorXml = $null
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host ("  [ .. ] a task named '" + $TaskName + "' already exists - replacing it")
+    $priorXml = Get-PriorXml -Name $TaskName
+    if ([string]::IsNullOrWhiteSpace($priorXml)) {
+        Fail ("a task named '" + $TaskName + "' exists but its definition could not be read") `
+             ("Without a copy of the task that is here now, this script cannot promise`n" +
+              "to put it back if registration goes wrong - and a half-replaced task is`n" +
+              "worse than one that was never touched. Remove it first:`n" +
+              "  powershell -ExecutionPolicy Bypass -File .\install\uninstall_agent.ps1`n" +
+              'then run this again.')
+    }
+    Write-Host '         (its current definition was saved, so a failure below is undone)'
 }
 
 try {
@@ -252,6 +370,8 @@ try {
     $null = Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force -ErrorAction Stop
 }
 catch {
+    # Nothing was replaced - Register-ScheduledTask -Force is atomic - so
+    # the plain Fail is accurate here and no rollback is needed.
     Fail ('could not register the task: ' + $_.Exception.Message) `
          ("If this says access is denied, the account cannot register tasks`n" +
           "even for itself, which is unusual and is a machine policy.`n" +
@@ -262,21 +382,42 @@ catch {
 # ---- read it back -------------------------------------------
 # Registering and reporting success are two different claims. This reads
 # the scheduler's own copy and checks the things that would silently
-# change behaviour if they were wrong.
+# change behaviour if they were wrong. Every failure from here on rolls
+# back: a task that is registered but wrong is the worst of the three
+# possible outcomes, because it looks installed.
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $task) {
-    Fail 'the task is not there after registering it' `
-         'Registration reported success and produced nothing. Call.'
+    FailAndRollBack $TaskName $priorXml `
+        'the task is not there after registering it' `
+        'Registration reported success and produced nothing. Call.'
 }
 
 $problems = @()
-$interval = $task.Triggers[0].Repetition.Interval
-if ($interval -ne 'PT3M') {
-    $problems += ("repetition interval is '" + $interval + "', expected PT3M")
-}
-if ($task.Triggers[0].Repetition.Duration) {
-    $problems += ("repetition has a duration ('" + $task.Triggers[0].Repetition.Duration +
-                  "') - it must be indefinite")
+
+# The repetition must sit on a trigger that fires without a logon. A logon
+# trigger registered while the user is already logged on never fires - the
+# logon event it waits for has already happened - so the task would sit
+# there looking installed and run zero times. Measured; see Get-TaskXml.
+$repeating = $task.Triggers | Where-Object { $_.Repetition -and $_.Repetition.Interval }
+if (-not $repeating) {
+    $problems += 'no trigger carries a repetition - the agent would run once, or never'
+} else {
+    if ($repeating.Count -gt 1) {
+        $problems += 'more than one trigger repeats - they would compete'
+    }
+    $repeat = @($repeating)[0]
+    if ($repeat.Repetition.Interval -ne 'PT3M') {
+        $problems += ("repetition interval is '" + $repeat.Repetition.Interval +
+                      "', expected PT3M")
+    }
+    if ($repeat.Repetition.Duration) {
+        $problems += ("repetition has a duration ('" + $repeat.Repetition.Duration +
+                      "') - it must be indefinite")
+    }
+    if ($repeat.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger') {
+        $problems += ('the repetition is on the logon trigger, which does not fire ' +
+                      'while the user is already logged on - the agent would never run')
+    }
 }
 if ($task.Principal.RunLevel -ne 'Limited') {
     $problems += ("principal RunLevel is '" + $task.Principal.RunLevel + "', expected Limited")
@@ -287,14 +428,26 @@ if ($task.Principal.UserId -notlike ('*' + $env:USERNAME)) {
 if ($task.Actions[0].Execute -notlike '*powershell*') {
     $problems += ("action is '" + $task.Actions[0].Execute + "', expected powershell.exe")
 }
+
+# The scheduler's own answer to "when will this next run". Empty means it
+# is not scheduled at all, which is exactly what the old logon-only trigger
+# produced: registered, enabled, and never going to run.
+$info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $info -or -not $info.NextRunTime) {
+    $problems += ('the scheduler reports no NextRunTime - the task is registered ' +
+                  'but not scheduled to run')
+}
+
 if ($problems.Count -gt 0) {
-    Fail ($problems -join "`n") `
-         ("The scheduler stored something other than what we asked for.`n" +
-          'Do not leave this running. Call.')
+    FailAndRollBack $TaskName $priorXml ($problems -join "`n") `
+        ("The scheduler stored something other than what we asked for.`n" +
+         'Do not leave this running. Call.')
 }
 
 Write-Host ("  [ OK ] registered  1 task named '" + $TaskName + "' (read back and checked)")
-Write-Host '         trigger    at logon, then every 3 minutes, indefinitely'
+Write-Host ('         trigger    every 3 minutes from ' + $startBoundary + ', indefinitely')
+Write-Host '                    plus once at logon, so a reboot does not wait 3 minutes'
+Write-Host ('         next run   ' + $info.NextRunTime)
 Write-Host '         action     powershell.exe -WindowStyle Hidden -> install\run_agent.ps1'
 Write-Host '         env        PYTHONUTF8=1, PYTHONIOENCODING=utf-8 (set by run_agent.ps1)'
 Write-Host '         limit      a cycle is killed after 15 minutes, which matches the'
@@ -308,10 +461,11 @@ Write-Host '    # expect LastTaskResult : 0'
 Write-Host '    # wait three minutes, run it again, expect a newer LastRunTime,'
 Write-Host '    # then: python agent.py --confirm - expect a NEWER heartbeat than step 6'
 Write-Host ''
-Write-Host '  ! The task runs at logon and only while this user is logged on.'
-Write-Host '    That is deliberate: running while logged off needs either a stored'
-Write-Host '    password or an administrator to grant a logon right, and this'
-Write-Host '    account has neither. If the till is ever logged out, cycles stop'
-Write-Host '    until someone logs back in. Tell the owner.'
+Write-Host '  ! The task repeats every 3 minutes, but only while this user is'
+Write-Host '    logged on. That is deliberate: running while logged off needs either'
+Write-Host '    a stored password or an administrator to grant a logon right, and'
+Write-Host '    this account has neither. If the till is ever logged out, cycles stop'
+Write-Host '    until someone logs back in - nothing is lost, because the watermark'
+Write-Host '    only ever moves forward. Tell the owner.'
 Write-Host ('=' * 66)
 exit 0
