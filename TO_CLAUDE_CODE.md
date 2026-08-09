@@ -1,238 +1,117 @@
 # Review — from the architect
 
-> Protocol: I write here, you reply in `FROM_CLAUDE_CODE.md`. I read it directly.
+> Protocol: I write here, you reply in `FROM_CLAUDE_CODE.md`.
 
 ---
 
-# 2026-08-09 (later) — PRIORITY ZERO: prove read-only, do not assert it
+# 2026-08-09 — CLOSE THE PROJECT. Final gate, then hand over.
 
-This comes before the one-click work below. Everything else in this product is
-negotiable. This is not.
+## The trigger finding
 
-The owner's position, and it is the right one: **the agent must be structurally
-incapable of writing to, altering, or deleting anything on the cashier machine.**
-Not "designed not to". Incapable.
+The LogonTrigger catch is the most valuable thing found on this project, and it is
+worth naming why rather than just fixing it.
 
-We have told this customer their POS will not be touched. If that turns out to be
-untrue once, nothing else we built matters.
+We had a green verification last session that proved the wrong thing. `Start-ScheduledTask`
+proved the task *can* run. It said nothing about whether it *would*. On a till logged in
+for weeks, the agent would have run **zero times** after the operator left — and every
+check we had would still have been green.
 
----
+That is the third instance of the same shape on this project: a check that shares the
+fault it is meant to detect. Watermark-0 comparing the table against itself. My manifest
+hashes reading the same working tree twice. And now a trigger verified by firing it
+ourselves. You found the third one by asking what Phase E would be waiting for *before*
+writing the wait. Keep that habit.
 
-## 1. Enumerate the layers, and rate each one honestly
+Both defects from the failure-mode review — `--confirm` never judging drift while
+VERIFY.md claimed it did, and a corrupt `state.json` wedging the agent forever — are the
+same class. Good finds.
 
-Produce a written audit of every layer that currently stands between this agent and a
-write. For each, say plainly whether it is **enforced by something outside our code**
-or merely **a convention we have been keeping**:
-
-- `monitor_ro` — `db_datareader` + `db_denydatawriter`. Does DENY actually cover every
-  path? Tables, views, **stored procedures**, DDL, `TRUNCATE`, `MERGE`, `EXEC`,
-  `SELECT INTO`, `sp_executesql`, linked servers, `xp_cmdshell`. Be specific about
-  what `db_denydatawriter` does **not** cover, because that is where the risk lives.
-- `pyodbc.connect(readonly=True)` — I believe this is a **hint** the SQL Server ODBC
-  driver may ignore. Confirm or refute with evidence, and if it is a hint, say so in
-  the audit rather than counting it as protection.
-- Every query being `SELECT ... WITH (NOLOCK)` — today this is convention plus review.
-  Convention is not a control.
-- The disk: does anything in the agent write outside its own working folder? Prove
-  nothing touches `D:\HDSOFT` or any POS path.
-
-I want the honest version, including anything that is weaker than we have been
-assuming. A layer we think exists and does not is worse than a missing one.
-
-## 2. A single choke point for SQL
-
-Every statement the adapter sends must pass through one function that refuses anything
-that is not a read. Not a review rule — a code path that raises.
-
-Reject `INSERT UPDATE DELETE MERGE DROP ALTER CREATE TRUNCATE EXEC EXECUTE GRANT
-REVOKE DENY BACKUP RESTORE SELECT…INTO` and anything else you identify as
-write-capable. Handle comment-stripping and multi-statement batches — `SELECT 1;
-DROP TABLE x` must be refused.
-
-`adapter_hdsoft.py` is locked. **Do not edit it.** Write the guard as its own module,
-give me the diff that wires it in, and I will apply it — same route as the cycle
-ceiling.
-
-## 3. A test that reads the source, not the intent
-
-Scan the adapter's source for write keywords in any SQL literal and fail. So a future
-edit that adds a write cannot pass review by looking innocent — the suite refuses it.
-
-## 4. 🎯 The one that matters: prove it empirically on the customer's machine
-
-This is the piece I actually want, and it is the same move that proved tenant
-isolation at gate 3. We did not argue that RLS worked — we attempted a foreign insert
-and got `42501`.
-
-Do the same here. **Preflight, before anything else, attempts to write to the POS
-database with the agent's own credentials, and requires every attempt to be refused.**
-
-Construct each probe to affect **zero rows**, so that a probe which is wrongly
-permitted still changes nothing:
-
-```sql
-UPDATE dbo.Sales SET saltot = saltot WHERE 1 = 0;
-DELETE FROM dbo.Sales WHERE 1 = 0;
-INSERT INTO dbo.Sales (salid) SELECT salid FROM dbo.Sales WHERE 1 = 0;
-```
-
-SQL Server checks permissions before it touches rows, so a denied statement raises and
-a permitted one is a no-op. Verify that assumption yourself before relying on it — if
-it does not hold, find probes where it does.
-
-Requirements:
-
-- **Every probe must be refused.** If any is permitted, **ABORT the whole install**,
-  loudly: this machine's credentials are wrong and nothing should run until we fix it.
-- Print the actual SQL error for each — the evidence belongs in the install transcript
-  and in the diagnostics zip. That transcript becomes our proof to the customer.
-- Do the same for DDL: an `ALTER TABLE` shaped probe that must be refused.
-- Run it every install, not once. Permissions drift; someone helpful "fixes" a login.
-
-If you can find a way to make a probe safe on a table nobody uses rather than `Sales`,
-prefer it — but the probe must exercise the same permission path, not a weaker one.
-
-## 5. What the installer touches on the machine
-
-Write the complete list: our own folder, one scheduled task, nothing else. If anything
-else is touched — registry, PATH, env vars, file associations — name it. The uninstall
-must reverse all of it and leave the machine as it was.
-
-## 6. Output
-
-A short document, `READONLY_GUARANTEE.md`, in plain language: what we promise, what
-enforces it at each layer, what the empirical proof is, and what would have to go wrong
-for it to fail. Written so it can be shown to the customer.
-
-Include what is **not** guaranteed, if anything. An honest boundary is worth more than
-a broad claim.
+Your two pushbacks are accepted: no `TRUNCATE` probe (there is no zero-row form and a
+permitted probe empties their sales table), and `HAS_PERMS_BY_NAME` in its place.
 
 ---
 
-# The one-click and logging work — unchanged, but second
+## Done on my side
 
-Everything in my previous note still stands and follows this. Reproduced below.
-
-# 2026-08-09 — one click, and a hard look at what breaks in week three
-
-Priority 3 (orchestrator/telegram/workflows) is paused. This comes first, because
-it decides whether the site visit succeeds and whether we can diagnose anything
-afterwards without going back.
-
----
-
-## Goal
-
-The operator copies the project folder onto the till, double-clicks **one file**, and
-walks away with a working, self-running agent — or with an unambiguous stop and a log
-we can read from here.
-
-He is not a Windows engineer, he will be standing in a working restaurant with a queue
-at the counter, and a second trip is the most expensive thing on this project.
-
----
-
-## 1. One click — the gates stay, they just stop being optional
-
-Fold VERIFY.md steps 1–8 into a single entry point.
-
-**This is not "run everything and hope".** Every gate we built stays exactly where it
-is. What changes is who enforces it: a person under pressure might look at a delta of
-7 and carry on. A script will not.
+**`sqlguard_wiring.patch` is applied.** `adapter_hdsoft.py` now imports `sqlguard` and
+`connect()` returns `sqlguard.guard(cn)`. Verified here:
 
 ```
-Phase A   preflight (read-only)                 steps 1-4
-  GATE    verdict must be PASS or FIRST RUN     ← else STOP, nothing written
-Phase B   one real cycle                        step 6
-Phase C   --confirm                             step 6
-  GATE    RESULT must be OK                     ← else STOP
-Phase D   register the scheduled task           step 7
-Phase E   wait for the task to fire, prove a NEW heartbeat arrived   step 7
-Phase F   final summary: what happened, what runs now, where the logs are
+31 passed          test_golden.py, unchanged
+302 total          280 passed + 21 skipped + 1 (git_revision, my copy has no .git)
+
+sqlguard behaviour, live:
+  SELECT TOP 1 ... WITH (NOLOCK)          passed
+  UPDATE / DELETE / DROP / EXEC           WriteAttempt
+  SELECT 1; DROP TABLE                    WriteAttempt   (multi-statement)
+  /* comment */ DELETE FROM               WriteAttempt   (comment-hidden verb)
+  SELECT * INTO x FROM                    WriteAttempt
 ```
 
-Requirements:
-
-- **Nothing is written anywhere before the Phase A gate passes.** That property is
-  what makes a single click safe, so prove it, don't assert it.
-- **Safe to run twice.** Every phase idempotent. Someone will double-click it again
-  because they are not sure it worked.
-- **No partial installs.** If Phase D fails, the machine must be left in the state it
-  was in before Phase D, not half-registered.
-- **The stop must be impossible to misread.** Screen-wide, what failed, which step,
-  what to do, where the log is, and "photograph this and call — change nothing".
-- Phase E is the one that proves the visit succeeded. Without a *new* heartbeat after
-  the task fires on its own, everything before it only proves a human can run the
-  agent by hand.
-
-Keep the individual entry points working for our own use. This is an addition.
-
-## 2. Logs — the thing that decides whether week three costs a trip
-
-Assume something misbehaves three weeks after we leave, nobody was watching, and the
-only way in is a file. Design for that reader.
-
-- **An install transcript**, timestamped, capturing every phase including the
-  failures. This is the file he photographs or sends.
-- **A rolling agent log**: every cycle, what it read, what it uploaded, what it
-  skipped and why, every error with its type and context. It must answer "what was
-  this machine doing at 03:14 last Tuesday" without a debugger.
-- **Rotation.** A log that fills a till's disk is a fault we caused. Size-capped,
-  bounded number of files, and prove the cap holds.
-- **Never any secret.** Not the token, not the SQL password, not a connection string.
-  Add a test that greps the produced logs for every secret in `config.json` and fails
-  if one appears. Config values must be masked at the logger, not by remembering.
-- **`collect_diagnostics.bat`** — one double-click producing one zip: install
-  transcript, agent logs, versions, ODBC drivers, task state, `sync_state`, last
-  heartbeats, `state.json`, manifest check. **No secrets.** So the answer to "it
-  stopped working" is one click and one file, not a conversation.
-
-## 3. A failure-mode review of the agent — this is the part I most want
-
-Take the broad, sharp look. Not features: **what breaks when nobody is watching.**
-
-Work through at least these, with evidence for each — either "handled, here is the
-test" or "not handled, here is what happens":
-
-- The network drops mid-upload, between the invoice batch and the line batch
-- Supabase returns 500 or 429 for an hour
-- The token expires or is revoked while the agent is running
-- The disk fills
-- The POS machine's clock jumps (DST, manual change, NTP correction)
-- `config.json` is edited or corrupted while the agent is running
-- SQL Server restarts mid-query
-- Two cycles overlap after a takeover
-- The agent is killed mid-upload — is the watermark still correct on restart?
-- HD Soft is upgraded and a column changes underneath us
-- The Supabase project is paused or the free tier fills
-
-For each: does it fail loudly, does it lose data, does it recover on its own, and does
-the log say enough to diagnose it from here? **Report the ones that are not handled
-even if you do not fix them** — an honest list is worth more than a fixed subset.
-
-## 4. Time-savers: evaluate, adopt only if provably better
-
-You have standing permission to propose a simpler route. Two I have considered and
-could not decide from here:
-
-- **A single PyInstaller executable**, removing the Python dependency from the till
-  entirely. Cleaner install, no version questions. Against it: antivirus false
-  positives on unsigned binaries are common and would be a very bad surprise in a
-  restaurant, plus a build step between the tests and what ships. **Evaluate; do not
-  adopt unless you can show it is safer than what we have.**
-- **Generating `config.json` from a prompt** instead of hand-editing, so a typo
-  becomes impossible rather than caught. Weigh against handling secrets interactively.
-
-Anything else you see, propose it. The bar is the same as always: **provably better and
-simpler, or we do not do it.** A shortcut that is merely faster is not a shortcut.
+Do **not** re-apply. Verify it is present and that the transcript now prints WIRED
+rather than NOT WIRED.
 
 ---
 
-## Discipline — unchanged
+## 🔴 The one thing that will bite at handover
 
-Evidence gates: state the falsifier, implement, paste raw output. Challenge before
-implementing. Loud failure over silent defaults. Locked files untouchable.
+`adapter_hdsoft.py` changed. **`ship/` still holds the pre-guard copy.**
 
-**And one specific to this task:** do not let "one click" quietly become "one click
-that skips a check". If any gate becomes hard to automate, say so and leave it manual.
-A manual step we perform is better than an automated one we trust wrongly.
+If `ship/` is not rebuilt, the integrity check at step 0 compares `ship/` against a
+`MANIFEST.txt` built from the same stale `ship/` — both agree, both are wrong, and the
+agent that runs on the till has **no SQL guard at all**. Silent, and it would pass every
+check we have.
+
+Rebuild `ship/`, regenerate `MANIFEST.txt`, and confirm `sqlguard.py` is in the ship
+list — the import-closure test should force this, so verify it actually fired rather
+than assuming it would.
+
+---
+
+## Closing gate — the rehearsal that matters
+
+The operator will **clone from GitHub at the shop**, not copy this folder. So the final
+test must be exactly that:
+
+1. `git clone` the pushed repo into a fresh directory, as he will
+2. Place a real `config.json`
+3. Double-click the one-click entry point
+4. It must reach the POS-connection failure and **stop cleanly** — there is no SQL Server
+   on your machine, so a clean, well-explained stop *is* the pass condition
+5. Confirm the install transcript exists, is readable, and contains no secret
+6. Run `collect_diagnostics.bat` and confirm the zip is produced and secret-free
+
+Anything that only works in the development folder and not in a fresh clone is a defect
+that would surface at the counter.
+
+Then: **commit and push to GitHub.** He downloads from there.
+
+## Also required
+
+- Full suite green, `test_golden.py` exactly **31**, no locked file modified beyond the
+  patch I applied.
+- `VERIFY.md` consistent with what the code now does. It has been wrong twice — once
+  about drift, once about the trigger. Read it against the code, not against memory.
+- G-Brain: the trigger trap as a reusable technique, plus the project note and index.
+- Priority 4 stays unevaluated and **labelled as priors, not findings**. Do not spend
+  budget on it now.
+
+## Final report — write it in `FROM_CLAUDE_CODE.md`
+
+For someone who has to trust this without reading the code:
+
+- What is proven, and by what evidence
+- What is **not** proven and cannot be from here — the POS connection succeeding, a
+  `LastTaskResult: 0`, the first real shift report
+- Known limitations, including the revoked-token blind spot you already named
+- Exactly what the operator does at the shop, and what he sends back
+- What is deliberately deferred: orchestrator, telegram, workflows, go-live
+
+Be honest about the boundary. A clear list of what is untested is worth more than a
+claim of completeness.
+
+## Budget
+
+Be economical. Do not re-verify what is already verified above — the patch, the golden
+tests, and sqlguard's behaviour are settled. Spend what you have on the fresh-clone
+rehearsal and the push; that is the only thing standing between us and the visit.

@@ -24,6 +24,8 @@ import datetime as _dt
 from dataclasses import dataclass, field
 from typing import Any
 
+import sqlguard
+
 # pyodbc محتاجه الأجينت بس (على جهاز الكاشير).
 # GitHub Actions بتشغّل الحساب والتقارير ومفيهاش ODBC drivers —
 # فالاستيراد اختياري عشان الاختبارات والتقارير تشتغل من غيره.
@@ -201,7 +203,9 @@ def connect(server: str, database: str, user: str, password: str,
         timeout=timeout, readonly=True,
     )
     cn.autocommit = True
-    return cn
+    # نقطة الاختناق: كل أمر بيعدي على sqlguard.assert_read_only قبل ما
+    # يوصل للسيرفر. مش قاعدة مراجعة - مسار كود بيرمي استثناء.
+    return sqlguard.guard(cn)
 
 
 def verify_schema(cn) -> None:

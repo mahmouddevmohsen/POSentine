@@ -385,6 +385,57 @@ def _local_imports(path):
     return {n for n in names if (P.HERE / f"{n}.py").exists()}
 
 
+def _reachable_imports(entry: str) -> set[str]:
+    """Every repository module reachable from an entry point, transitively.
+
+    🔴 This used to walk one level and was called "closed under import",
+    which it was not. `sqlguard` is imported by `adapter_hdsoft.py`, not by
+    any entry point, so removing it from the ship list passed this test —
+    and would have put an agent on the till that raises
+    `ModuleNotFoundError: No module named 'sqlguard'` at install time,
+    with the SQL guard absent entirely.
+
+    The architect asked for this to be verified rather than assumed. It was
+    assumed, and it was wrong. A closure that only closes over the first
+    level is not a closure.
+    """
+    seen: set[str] = set()
+    queue = [entry]
+    while queue:
+        name = queue.pop()
+        for module in _local_imports(P.HERE / name):
+            if module not in seen:
+                seen.add(module)
+                queue.append(f"{module}.py")
+    return seen
+
+
+@pytest.mark.parametrize("entry", ["agent.py", "preflight.py", "test_golden.py"])
+def test_the_ship_list_is_closed_under_transitive_import(entry):
+    """The real closure: follow the import graph all the way down."""
+    import make_ship as S
+    shipped = {name for name, _ in S.SHIPPED}
+    missing = sorted(f"{m}.py" for m in _reachable_imports(entry)
+                     if f"{m}.py" not in shipped)
+    assert not missing, (
+        f"{entry} reaches {missing}, which ship/ does not contain. "
+        "The agent would raise ImportError on the customer machine."
+    )
+
+
+def test_the_closure_test_would_notice_a_module_two_levels_down():
+    """Falsifier. `sqlguard` is reachable only through `adapter_hdsoft`, and
+    the single-level version of this test passed while it was missing."""
+    assert "sqlguard" in _reachable_imports("agent.py"), (
+        "sqlguard is no longer reachable from agent.py — either the wiring "
+        "patch was reverted, or this test has stopped testing")
+    assert "sqlguard" not in _local_imports(P.HERE / "agent.py"), (
+        "sqlguard is now a direct import of agent.py, so this test no "
+        "longer proves the walk is transitive; point it at a module that is "
+        "still two levels down"
+    )
+
+
 @pytest.mark.parametrize("entry", ["agent.py", "preflight.py", "test_golden.py"])
 def test_the_ship_list_is_closed_under_import(entry):
     """Derived from the source, not from a list someone maintains by hand.

@@ -57,14 +57,23 @@ hand. **Read on when it stops.**
 double-click preflight.bat
 ```
 
-Steps 1 to 4 are the read-only ones, and they are the ones with the most typing
-in them. `preflight.bat` runs all four: console to UTF-8, Python, dependencies,
-config and the **decoded** token, the golden baseline, then `agent.py --dry-run`.
+`preflight.bat` runs steps 1 to 4 plus **3b**: console to UTF-8, Python,
+dependencies, config and the **decoded** token, the golden baseline, the
+read-only proof, then `agent.py --dry-run`.
 
-It **stops at the first failure**, names the step, and says what to do. It writes
-nothing to the POS and nothing to the cloud, so one click carries no risk. It ends
+It **stops at the first failure**, names the step, and says what to do. It ends
 by printing the dry-run block exactly as the agent produced it, and its own verdict
 under it.
+
+Nothing here writes to the cloud, and nothing writes to the POS *data*. Step 3b
+does deliberately **send writes** to the POS and require the server to refuse them
+— every probe carries `WHERE 1 = 0`, so a probe that is wrongly permitted still
+changes nothing. Two other things are written to the machine and named here so the
+claim is exact: `pip install` writes into the Python installation, and this
+transcript is written to `logs\`.
+
+Safe to run at any time, including months later, to re-check that the POS still
+refuses us.
 
 Before anything else it checks every file against `MANIFEST.txt`, so "this machine
 is running the code we verified" is a fact rather than an assumption.
@@ -361,30 +370,54 @@ It registers **user-level, LeastPrivilege, never SYSTEM**, reads the task back f
 scheduler and checks it, and **stops** if registration fails on privileges rather than
 falling back to something weaker.
 
-Expect `LastTaskResult : 0`.
+It also **rolls back**. The task that was there before is exported first, and if any
+read-back check fails it is restored byte-for-byte. A failed step 7 leaves the machine
+exactly as it was, never half-installed.
+
+Right after registering, expect:
+
+```text
+NextRunTime    : <a time within the next 3 minutes>
+LastTaskResult : 267011
+```
+
+> ### 🛑 `267011` here is correct, and `0` would be suspicious
+>
+> `267011` is `SCHED_S_TASK_HAS_NOT_RUN`. The task has just been created and has not
+> run yet — that is the only honest value.
+>
+> **The field that matters right now is `NextRunTime`.** If it is **empty**, the task
+> is registered but *not scheduled*, and it will never run. That is exactly the fault
+> this step used to have: the repetition was attached to a logon trigger, which does
+> not fire while the till user is already logged on, so the agent would have run zero
+> times after you left with every check still green.
+>
+> **STOP IF `NextRunTime` is empty.**
 
 **STOP IF** it refuses because `config.json` is missing. That is deliberate: a task
 installed before step 6 fails every three minutes into a log nobody is reading yet.
 
-Wait three minutes, then:
+Now wait **three minutes and do nothing** — do not use `Start-ScheduledTask`. Starting
+it yourself proves the task *can* run and says nothing about whether it *will*, which
+is the whole point of this wait.
 
 ```powershell
 Get-ScheduledTask -TaskName thirdeyev | Get-ScheduledTaskInfo
 python agent.py --confirm
 ```
 
-Expect `LastRunTime` inside the last three minutes, `LastTaskResult : 0`, and a **newer**
-heartbeat than the one from step 6.
+Now expect `LastRunTime` inside the last three minutes, `LastTaskResult : 0`, and a
+**newer** heartbeat than the one from step 6.
 
 **STOP IF** `LastTaskResult` is not 0, or no new heartbeat appeared. The task is
-registered but not running, and nothing will arrive after you leave.
+registered but not working, and nothing will arrive after you leave.
 
-> **Tell the owner:** the task runs **at logon and only while the till user is logged
-> on**. Running while logged off needs either a stored password or an administrator to
-> grant a logon right, and this account has neither — so this is the correct choice,
-> not a shortcut. If the machine is ever logged out, cycles stop until someone logs
-> back in. The 3-minute repetition then resumes by itself; nothing is lost, because
-> the watermark only ever moves forward.
+> **Tell the owner:** the task repeats **every 3 minutes, but only while the till user
+> is logged on**. Running while logged off needs either a stored password or an
+> administrator to grant a logon right, and this account has neither — so this is the
+> correct choice, not a shortcut. If the machine is ever logged out, cycles stop until
+> someone logs back in, and then resume by themselves; nothing is lost, because the
+> watermark only ever moves forward.
 
 ---
 
