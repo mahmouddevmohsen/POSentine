@@ -40,6 +40,24 @@ BACKOFF_CAP_SECONDS = 30.0
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
+# Columns the server owns. A payload carrying one of these is a bug, and the
+# kind that surfaces late and looks like something else:
+#
+#   pos_products.is_modifier  GENERATED ALWAYS AS (...) STORED — PostgREST
+#                             answers 428C9, and only at the first product
+#                             sync, far from the code that added the column.
+#   invoices.first_seen_at    anchors the 30-minute deletion guard. Rewriting
+#                             it on every rescan would make a real deletion
+#                             permanently invisible.
+#   invoices.deleted_at       the orchestrator's to set, never a sync's.
+#
+# Refused here so none of them can reach a live table.
+NEVER_SEND: dict[str, frozenset[str]] = {
+    "pos_products": frozenset({"is_modifier"}),
+    "invoices": frozenset({"first_seen_at", "deleted_at"}),
+    "invoice_lines": frozenset({"first_seen_at"}),
+}
+
 
 class SupaError(RuntimeError):
     """Any REST failure. Never carries a credential in its message."""
@@ -212,8 +230,24 @@ class Supa:
 
     # ── writes ──────────────────────────────────────────────────
 
+    def _check_payload(self, table: str,
+                       rows: Iterable[Mapping[str, Any]]) -> None:
+        """Refuse server-owned columns before anything leaves the process."""
+        banned = NEVER_SEND.get(table)
+        if not banned:
+            return
+        for i, row in enumerate(rows):
+            offenders = sorted(banned.intersection(row))
+            if offenders:
+                raise SupaError(
+                    f"{table}: row {i} carries server-owned column(s) "
+                    f"{offenders} — generated or orchestrator-owned, never "
+                    "written by a sync. Drop them from the payload."
+                )
+
     def _write_batches(self, table: str, rows: Sequence[Mapping[str, Any]],
                        prefer: str, params: Mapping[str, str]) -> int:
+        self._check_payload(table, rows)
         if not rows:
             return 0
 
@@ -256,6 +290,7 @@ class Supa:
     def insert(self, table: str, rows: Sequence[Mapping[str, Any]],
                returning: bool = True) -> list[dict[str, Any]]:
         """Plain insert. Returns the created rows when returning=True."""
+        self._check_payload(table, rows)
         if not rows:
             return []
         prefer = "return=representation" if returning else "return=minimal"
@@ -268,6 +303,7 @@ class Supa:
                patch: Mapping[str, Any],
                returning: bool = True) -> list[dict[str, Any]]:
         """PATCH rows matching PostgREST filters, e.g. {'salid': 'eq.42'}."""
+        self._check_payload(table, [patch])
         prefer = "return=representation" if returning else "return=minimal"
         body = json.dumps(patch, ensure_ascii=False, default=str).encode("utf-8")
         resp = self._request("PATCH", table,

@@ -245,3 +245,56 @@ def test_upsert_of_nothing_makes_no_request():
     client, session, _ = make([])
     assert client.upsert("invoices", [], on_conflict="salid") == 0
     assert session.calls == []
+
+
+# ════════════════════════════════════════════════════════════════
+# 5) columns the client must never send
+# ════════════════════════════════════════════════════════════════
+
+def test_generated_column_is_rejected_before_the_request():
+    """
+    pos_products.is_modifier is GENERATED ALWAYS AS (...) STORED
+    (schema.sql:124). Any payload carrying it fails with 428C9 — and it
+    would first bite at the agent's product sync, not here. Caught in the
+    client so it cannot reach a live table at all.
+    """
+    client, session, _ = make([])
+    with pytest.raises(supa.SupaError) as exc:
+        client.upsert("pos_products",
+                      [{"itid": 1, "itname": "طعمية", "is_modifier": False}],
+                      on_conflict="tenant_id,source_id,itid")
+    assert "is_modifier" in str(exc.value)
+    assert session.calls == [], "must fail before any request is made"
+
+
+def test_server_owned_columns_are_rejected():
+    """
+    first_seen_at must survive updates (it anchors the 30-minute deletion
+    guard), and deleted_at belongs to the orchestrator. Sending either from
+    a sync would quietly rewrite history.
+    """
+    client, _, _ = make([])
+    for col in ("first_seen_at", "deleted_at"):
+        with pytest.raises(supa.SupaError) as exc:
+            client.upsert("invoices", [{"salid": 1, col: "2026-08-09T00:00:00Z"}],
+                          on_conflict="salid")
+        assert col in str(exc.value)
+
+
+def test_clean_payload_is_untouched():
+    client, session, _ = make([FakeResponse(201)])
+    client.upsert("pos_products",
+                  [{"itid": 1, "itname": "طعمية", "list_price": 15}],
+                  on_conflict="tenant_id,source_id,itid")
+    assert len(session.calls) == 1
+    assert supa._decode(session.calls[0]["data"])[0]["itname"] == "طعمية"
+
+
+def test_rejection_names_the_row_index():
+    """One bad row in 500 must be findable."""
+    client, _, _ = make([])
+    payload = [{"itid": i} for i in range(5)]
+    payload[3]["is_modifier"] = True
+    with pytest.raises(supa.SupaError) as exc:
+        client.upsert("pos_products", payload, on_conflict="itid")
+    assert "3" in str(exc.value)
