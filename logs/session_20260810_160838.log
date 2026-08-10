@@ -614,3 +614,22 @@ origin/main = 5a49761
 
 release:
   v1.0.0  asset: posentine-23af648ce8d6.zip  (131279 bytes, 0 downloads)
+
+### GATE — what changed between the released commit and current main? ###
+
+released asset built from : 23af648
+current origin/main       : 4de8910
+
+4de8910 chore: session log for the identity-probe fix
+5a49761 docs: reply - three integrity states, _wrap audit, and the Release verified by download
+
+--- files changed in those commits ---
+ FROM_CLAUDE_CODE.md              | 203 +++++++++++++++++++++++++++++++++++++++
+ logs/session_20260810_160838.log |  40 ++++++++
+ 2 files changed, 243 insertions(+)
+
+--- any SHIPPED file among them? ---
+  shipped files changed since the release: NONE
+...................................................                      [100%]
+339 passed in 6.41s
+ship/ rebuilt

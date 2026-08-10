@@ -17,13 +17,30 @@ Time if nothing goes wrong: ~20 minutes. Budget 45.
 
 ## 0 — The whole thing in one click
 
-> **Download the release zip from GitHub Releases, or `git clone`.**
-> Do **not** use the green "Download ZIP" button on the repository page. A
-> repository ZIP has no `.git` and no `MANIFEST.txt`, so **nothing can
-> confirm this machine is running the code we tested** — step 0 will say
-> `NOT VERIFIED` and mean it. The release zip carries its own manifest and
-> is checked file by file. (This is not hypothetical: the 2026-08-10
-> install ran from a repository ZIP with no integrity check at all.)
+> ## What to download
+>
+> **Release `v1.0.1`**, from:
+>
+> ```
+> https://github.com/mahmouddevmohsen/POSentine/releases/latest
+> ```
+>
+> Take the single **`posentine-<commit>.zip`** asset attached to that
+> release. The filename carries the commit it was built from, so it changes
+> with every release — that is deliberate, and it is why this document names
+> the *release* rather than a filename that would be out of date the moment
+> it shipped. Inside the zip, `MANIFEST.txt` records the same commit.
+>
+> **Do NOT use the green `Code → Download ZIP` button** on the repository
+> page. A repository ZIP has no `.git` and no `MANIFEST.txt`, so **nothing
+> can confirm this machine is running the code we tested** — step 0 says
+> `NOT VERIFIED` and makes you type an acknowledgement before it continues.
+>
+> This is not hypothetical. The 2026-08-10 install ran from a repository
+> ZIP, with no integrity check at all.
+>
+> `git clone` is equally fine — a clean checkout is verified against its
+> commit.
 
 ```
 double-click INSTALL.bat
