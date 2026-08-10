@@ -287,5 +287,48 @@ def build() -> int:
     return 0
 
 
+def make_zip() -> Path:
+    """Pack ship/ into the artifact the operator actually downloads.
+
+    Why this exists (2026-08-10): the customer machine installed from
+    `C:\\Users\\Techno\\Downloads\\POSentine-main` — a GitHub **ZIP of the
+    repository**, not a clone. A ZIP has no `.git`, and `ship/` is
+    gitignored so the ZIP had no `MANIFEST.txt` either. Both integrity
+    mechanisms were therefore absent on the one path the operator took, and
+    the install proceeded with `code integrity NOT VERIFIED`.
+
+    Requiring `git clone` instead would put a new dependency on a till we do
+    not control, discovered at the counter. This is the other way round: the
+    download IS the verified folder, manifest included.
+
+    It also fixes something noted at handover and never acted on — a repo
+    ZIP carries `fake_adapter.py`, the whole test suite and our
+    correspondence onto the customer machine. This carries 24 files and
+    nothing else.
+
+    Attach the result to a GitHub Release. `MANIFEST.txt` inside it records
+    the commit it was built from, so a folder on a till traces back to a
+    revision rather than to a memory.
+    """
+    import zipfile
+
+    revision = git_revision().split()[0][:12]
+    target = HERE / f"posentine-{revision}.zip"
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(SHIP.rglob("*")):
+            if path.is_file():
+                zf.write(path, Path("posentine") / path.relative_to(SHIP))
+    return target
+
+
 if __name__ == "__main__":
-    sys.exit(build())
+    code = build()
+    if code == 0 and "--zip" in sys.argv:
+        archive = make_zip()
+        print()
+        print(f"  release artifact: {archive.name}  "
+              f"({archive.stat().st_size // 1024} KB)")
+        print("  Attach this to a GitHub Release. It is what the operator")
+        print("  downloads — it carries MANIFEST.txt, so a ZIP install is")
+        print("  integrity-checked exactly like a clone.")
+    sys.exit(code)

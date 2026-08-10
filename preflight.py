@@ -253,8 +253,21 @@ def verify_manifest(root: Path) -> str:
         from_git = verify_with_git(root)
         if from_git:
             return from_git
-        return ("code integrity   NOT VERIFIED — no MANIFEST.txt, and this is "
-                "not a clean git checkout")
+        # Reached on the customer machine on 2026-08-10: the folder was a
+        # GitHub ZIP of the repository (`...\Downloads\POSentine-main`), so
+        # there was no `.git` and no MANIFEST.txt, and the only wording the
+        # operator saw was "NOT VERIFIED" with nothing to do about it.
+        # Named explicitly now, because "we did not check" must never read
+        # like a shrug.
+        return ("code integrity   NOT VERIFIED — this folder is neither a "
+                "release download\n"
+                "                   (no MANIFEST.txt) nor a git checkout "
+                "(no .git). A ZIP of the\n"
+                "                   repository is neither. Nothing here "
+                "confirms this machine is\n"
+                "                   running the code we tested. Use the "
+                "release zip from\n"
+                "                   GitHub Releases, or `git clone`.")
 
     try:
         entries = read_manifest(path)

@@ -53,10 +53,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-# Verdicts. Only REFUSED is a pass; INCONCLUSIVE is deliberately not one.
+# Verdicts. Only REFUSED is a pass; nothing else is.
 REFUSED = "REFUSED"
 PERMITTED = "PERMITTED"
 INCONCLUSIVE = "INCONCLUSIVE"
+# Our probe was malformed for this schema. Blocks the install like any other
+# non-REFUSED result, but it is OUR fault and the report must say so — telling
+# a customer their credentials are unsafe when our SQL was wrong is its own
+# kind of wrong answer.
+PROBE_DEFECT = "PROBE DEFECT"
+NO_PROBEABLE_COLUMN = "NO PROBEABLE COLUMN"
 
 # SQL Server errors that mean "you are not allowed to do that".
 #   229  The <perm> permission was denied on object ...
@@ -64,6 +70,29 @@ INCONCLUSIVE = "INCONCLUSIVE"
 #   262  <perm> permission denied in database ...
 #   300  VIEW SERVER STATE permission was denied ...
 PERMISSION_DENIED_NATIVE = frozenset({229, 230, 262, 300})
+
+# 🔴 Errors that mean "this statement is impossible", NOT "you lack permission".
+#
+# This is the defect that produced a false NOT READ-ONLY verdict on the
+# customer's machine and blocked a correct install. The three UPDATE probes
+# targeted the primary keys — salid, saledeid, Itid — and all three are
+# IDENTITY columns. SQL Server refuses to update an identity column whatever
+# permissions you hold, so the probe could not tell "denied" from
+# "impossible", returned INCONCLUSIVE, and the aggregate failed closed.
+#
+# Failing closed was right. The probe was wrong. These are named so that a
+# structural refusal can never again be mistaken for either a permission
+# refusal OR evidence that writing is allowed.
+STRUCTURAL_NATIVE: dict[int, str] = {
+    8102: "cannot update an IDENTITY column - SQL Server refuses this whatever "
+          "permissions the login holds, so it proves nothing either way",
+    544:  "cannot insert an explicit value into an IDENTITY column while "
+          "IDENTITY_INSERT is OFF - refused whatever permissions are held",
+    271:  "cannot update a COMPUTED column - refused whatever permissions "
+          "are held",
+    272:  "cannot update a TIMESTAMP/ROWVERSION column - refused whatever "
+          "permissions are held",
+}
 
 POS_TABLES = ("dbo.Sales", "dbo.SalesDe", "dbo.Items")
 
@@ -82,6 +111,12 @@ class ProbeResult:
     sqlstate: str | None = None
     native: int | None = None
     message: str = ""
+    # Why this was not a clean REFUSED. Mandatory for every verdict other
+    # than REFUSED: the customer bundle that exposed the identity defect
+    # said only "INCONCLUSIVE" with a truncated message, and the one fact
+    # that would have settled it in seconds — the error number — had been
+    # cut off the end of the line.
+    reason: str = ""
 
 
 @dataclass
@@ -101,6 +136,11 @@ class Report:
     effective: list[str] = field(default_factory=list)
     guard_wired: bool = False
     failure: str | None = None
+    # Which column each write probe targeted, discovered at runtime. On the
+    # report so the next person can see what was actually written to without
+    # reading the SQL.
+    probe_columns: dict[str, str | None] = field(default_factory=dict)
+    column_errors: dict[str, str] = field(default_factory=dict)
 
     # Roles that make every other check on this page irrelevant.
     #   sysadmin  — SQL Server skips permission checks entirely, so the
@@ -132,16 +172,35 @@ class Report:
         return names
 
     @property
+    def probe_defects(self) -> list[str]:
+        """Probes that could not run correctly. Our bug, not their login.
+
+        Kept apart from `inconclusive` and `permitted` on purpose. All three
+        block the install, but only one of them justifies telling a customer
+        their credentials are unsafe — and saying that when our own SQL was
+        malformed is a wrong answer delivered with confidence, which is the
+        exact failure this product exists to prevent.
+        """
+        return [r.probe.name for r in self.writes
+                if r.verdict in (PROBE_DEFECT, NO_PROBEABLE_COLUMN)]
+
+    @property
     def passed(self) -> bool:
         """Every write refused, every dangerous permission answered 'no'.
 
-        An inconclusive answer is a failure. "We could not tell" and
+        Anything other than REFUSED is a failure. "We could not tell" and
         "it is refused" must never produce the same outcome — that is the
         whole failure mode this product exists to avoid.
+
+        🔴 This deliberately still fails closed on a probe defect. Failing
+        closed was the CORRECT behaviour on the customer machine; the probe
+        was wrong, not the gate. Nothing here has been relaxed — only the
+        wording of the report distinguishes the causes.
         """
         return (self.failure is None
                 and not self.permitted
                 and not self.inconclusive
+                and not self.probe_defects
                 and bool(self.writes)
                 and bool(self.permissions))
 
@@ -150,42 +209,90 @@ class Report:
 # the probes
 # ════════════════════════════════════════════════════════════════
 
-def write_probes(tables: tuple[str, ...] = POS_TABLES) -> list[Probe]:
-    """Zero-row writes. Every one must be refused.
+# A column we can legally write to, chosen by asking the server rather than
+# by us knowing the schema. Deliberately NOT hardcoded: hardcoding the primary
+# key is exactly what produced the false verdict, and the next customer's
+# schema is not this one.
+#
+# Excluded, because each is refused for a structural reason that would make
+# the probe meaningless again:
+#   is_identity   → Msg 8102 on UPDATE, Msg 544 on INSERT
+#   is_computed   → Msg 271
+#   rowversion    → Msg 272
+#   is_rowguidcol → ROWGUIDCOL has its own restrictions
+PROBEABLE_COLUMN_SQL = """
+SELECT TOP 1 c.name
+  FROM sys.columns c
+  JOIN sys.tables tb ON tb.object_id = c.object_id
+  JOIN sys.schemas sc ON sc.schema_id = tb.schema_id
+  JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+ WHERE sc.name = ? AND tb.name = ?
+   AND c.is_identity = 0
+   AND c.is_computed = 0
+   AND c.is_rowguidcol = 0
+   AND ty.name NOT IN ('timestamp', 'rowversion')
+ ORDER BY c.column_id
+"""
 
-    Built rather than listed so the same three shapes cover every table we
-    read: a login denied on Sales but not on Items would otherwise pass.
+
+def probeable_column(cursor, table: str) -> str | None:
+    """The first column on `table` that a write probe can legally target.
+
+    None when the table has no such column — which is a limitation of the
+    probe, never evidence that writing is permitted. The caller must keep
+    those two apart.
+    """
+    schema, _, name = table.partition(".")
+    if not name:
+        schema, name = "dbo", schema
+    cursor.execute(PROBEABLE_COLUMN_SQL, schema, name)
+    row = cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def write_probes(columns: dict[str, str | None]) -> list[Probe]:
+    """Zero-row writes, one set per table. Every one must be refused.
+
+    `columns` maps each table to the column discovered by
+    `probeable_column()`. It is a required argument rather than something
+    this function works out for itself, because a default would be a
+    hardcoded schema and a hardcoded schema is the bug.
     """
     probes: list[Probe] = []
-    for table in tables:
-        probes.append(Probe(
-            name=f"UPDATE {table}",
-            # `SET <col> = <col>` needs no literal and changes nothing even
-            # if a row somehow qualified.
-            sql=f"UPDATE {table} SET {_self_assign(table)} WHERE 1 = 0",
-            permitted_means="this login can modify existing rows"))
+    for table, column in columns.items():
+        if column is None:
+            # Recorded as a probe, so it appears in the report and blocks the
+            # install, rather than silently reducing what was tested.
+            probes.append(Probe(
+                name=f"UPDATE {table}",
+                sql=f"(no writable column found on {table})",
+                permitted_means="not established — the probe could not run"))
+            probes.append(Probe(
+                name=f"INSERT {table}",
+                sql=f"(no writable column found on {table})",
+                permitted_means="not established — the probe could not run"))
+        else:
+            probes.append(Probe(
+                name=f"UPDATE {table}",
+                # `SET <col> = <col>` needs no literal and changes nothing
+                # even if a row somehow qualified.
+                sql=f"UPDATE {table} SET {column} = {column} WHERE 1 = 0",
+                permitted_means="this login can modify existing rows"))
+            probes.append(Probe(
+                name=f"INSERT {table}",
+                # Sourced from the table itself, so no value is invented and
+                # no column type has to be guessed. Uses the same discovered
+                # column: an identity column here would raise Msg 544, which
+                # is the identical trap one statement over.
+                sql=(f"INSERT INTO {table} ({column}) "
+                     f"SELECT {column} FROM {table} WHERE 1 = 0"),
+                permitted_means="this login can add rows"))
+        # DELETE names no column, so it was never affected by any of this.
         probes.append(Probe(
             name=f"DELETE {table}",
             sql=f"DELETE FROM {table} WHERE 1 = 0",
             permitted_means="this login can remove rows"))
-        probes.append(Probe(
-            name=f"INSERT {table}",
-            # Sourced from the table itself, so no value is invented and
-            # no column type has to be guessed.
-            sql=(f"INSERT INTO {table} ({_key(table)}) "
-                 f"SELECT {_key(table)} FROM {table} WHERE 1 = 0"),
-            permitted_means="this login can add rows"))
     return probes
-
-
-def _key(table: str) -> str:
-    return {"dbo.Sales": "salid", "dbo.SalesDe": "saledeid",
-            "dbo.Items": "Itid"}.get(table, "id")
-
-
-def _self_assign(table: str) -> str:
-    column = _key(table)
-    return f"{column} = {column}"
 
 
 # Asked, never attempted. See the module docstring for why.
@@ -269,27 +376,57 @@ def _looks_like_permission_denied(sqlstate: str | None, native: int | None,
     return "permission" in low and "denied" in low
 
 
+def classify(sqlstate: str | None, native: int | None, message: str) -> tuple[str, str]:
+    """(verdict, reason) for a refused statement.
+
+    The order matters. A structural refusal is checked FIRST, because
+    "cannot update an identity column" arrives with the same SQLSTATE
+    (42000) as a permission denial and would otherwise fall through to
+    INCONCLUSIVE — which is what happened on the customer's machine.
+    """
+    if native in STRUCTURAL_NATIVE:
+        return PROBE_DEFECT, (
+            f"Msg {native}: {STRUCTURAL_NATIVE[native]}. This is a defect in "
+            "our probe, not a finding about this login.")
+    if _looks_like_permission_denied(sqlstate, native, message):
+        return REFUSED, ""
+    return INCONCLUSIVE, (
+        f"the server refused it, but not with a permission error "
+        f"(SQLSTATE {sqlstate or '?'}, Msg {native if native is not None else '?'}). "
+        "Refusal for an unknown reason does not establish that writing is "
+        "denied.")
+
+
 def run_write_probes(raw_cursor_factory, probes: list[Probe]) -> list[ProbeResult]:
     """Attempt each write. Refusal is the pass."""
     results: list[ProbeResult] = []
     for probe in probes:
+        if probe.sql.startswith("(no writable column"):
+            # Never sent. Recorded so the report shows what was not tested.
+            results.append(ProbeResult(
+                probe, NO_PROBEABLE_COLUMN,
+                reason="every column on this table is an identity, computed "
+                       "or rowversion column, so there is nothing a write "
+                       "probe can legally target. This is a limitation of "
+                       "the probe. It is NOT evidence that writing is "
+                       "permitted, and it is NOT evidence that it is denied."))
+            continue
         cursor = raw_cursor_factory()
         try:
             cursor.execute(probe.sql)
         except Exception as exc:                       # noqa: BLE001
             sqlstate, native, message = _error_parts(exc)
-            verdict = (REFUSED
-                       if _looks_like_permission_denied(sqlstate, native, message)
-                       else INCONCLUSIVE)
+            verdict, reason = classify(sqlstate, native, message)
             results.append(ProbeResult(probe, verdict, sqlstate, native,
-                                       message.strip()))
+                                       message.strip(), reason))
         else:
             # It ran. Zero rows changed by construction, and that is the
             # only reason this is survivable.
             results.append(ProbeResult(
                 probe, PERMITTED, None, None,
                 "the statement was accepted and executed (0 rows, by "
-                "construction) — the server did not refuse it"))
+                "construction) - the server did not refuse it",
+                "the server did not refuse a write"))
         finally:
             try:
                 cursor.close()
@@ -341,7 +478,19 @@ def run(cn, tables: tuple[str, ...] = POS_TABLES) -> Report:
         report.failure = f"could not read the connection's identity: {exc}"
         return report
 
-    report.writes = run_write_probes(lambda: raw.cursor(), write_probes(tables))
+    # Ask the server which column each probe may legally target, before
+    # building a single statement. Read-only, and it goes through the
+    # guarded cursor like every other read.
+    columns: dict[str, str | None] = {}
+    for table in tables:
+        try:
+            columns[table] = probeable_column(cn.cursor(), table)
+        except Exception as exc:                       # noqa: BLE001
+            report.column_errors[table] = f"{type(exc).__name__}: {exc}"
+            columns[table] = None
+    report.probe_columns = dict(columns)
+
+    report.writes = run_write_probes(lambda: raw.cursor(), write_probes(columns))
     report.permissions = run_permission_checks(cn.cursor(),
                                                permission_checks(tables))
 
@@ -400,13 +549,42 @@ def format_report(report: Report, width: int = 66) -> str:
     w("")
 
     w("  " + "-" * (width - 4))
+    w("  COLUMN CHOSEN FOR EACH WRITE PROBE (asked of the server, not assumed)")
+    w("  " + "-" * (width - 4))
+    for table, column in report.probe_columns.items():
+        if column:
+            w(f"    {table:<16} {column}   (not identity, not computed)")
+        else:
+            w(f"    {table:<16} NONE FOUND - probes on this table could not run")
+        if table in report.column_errors:
+            w(f"                     could not ask: {report.column_errors[table]}")
+    if report.probe_columns:
+        w("")
+
+    w("  " + "-" * (width - 4))
     w("  ATTEMPTED - each of these was actually sent to the POS")
     w("  " + "-" * (width - 4))
     for result in report.writes:
-        w(f"    {result.verdict:<13} {result.probe.name}")
+        w(f"    {result.verdict:<20} {result.probe.name}")
         w(f"      {result.probe.sql}")
+        # The error NUMBER, on its own line and never truncated. The bundle
+        # that exposed the identity defect showed only
+        # "[42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ..." — the
+        # number had been cut off, and it was the one fact that would have
+        # settled the whole thing in seconds. 229 = permission denied.
+        # 8102 = identity refusal.
+        if result.sqlstate or result.native is not None:
+            w(f"      SQLSTATE {result.sqlstate or '?'}   "
+              f"Msg {result.native if result.native is not None else '?'}")
         if result.message:
-            w(f"      -> {_wrap(result.message, width - 10)}")
+            for line in _fold(result.message, width - 8):
+                w(f"      {line}")
+        # Every verdict other than REFUSED has to say why it is not REFUSED.
+        if result.reason:
+            folded = _fold(result.reason, width - 11)
+            w(f"      why: {folded[0]}")
+            for line in folded[1:]:
+                w(f"           {line}")
         if result.verdict == PERMITTED:
             w(f"      !! {result.probe.permitted_means}")
         w("")
@@ -427,29 +605,92 @@ def format_report(report: Report, width: int = 66) -> str:
     w("  " + "-" * (width - 4))
     w(f"  Everything this login may do to {POS_TABLES[0]}, per the server:")
     w("  " + "-" * (width - 4))
-    w(f"    {', '.join(report.effective) or '(none)'}")
+    # Distinct, sorted. fn_my_permissions returns one row PER COLUMN, so the
+    # customer's report printed "SELECT" 46 times and reading it to confirm
+    # that UPDATE was absent meant scanning 46 identical tokens. The count is
+    # kept because it is the evidence that the query ran at all.
+    distinct = sorted(set(report.effective))
+    w(f"    {', '.join(distinct) or '(none)'}")
+    if len(report.effective) != len(distinct):
+        w(f"    ({len(report.effective)} rows, one per column; shown distinct)")
     w("")
 
     if report.passed:
         w("  VERDICT: READ-ONLY CONFIRMED")
         w("  Every write was refused by the server, and no permission that")
         w("  could alter or remove data is held by this login.")
-    else:
-        w("  VERDICT: NOT READ-ONLY — DO NOT INSTALL")
+    elif report.permitted:
+        # The only case that justifies telling a customer their credentials
+        # are unsafe.
+        w("  VERDICT: NOT READ-ONLY - DO NOT INSTALL")
         for name in report.permitted:
             w(f"    !! PERMITTED: {name}")
         for name in report.inconclusive:
             w(f"    ?? COULD NOT ESTABLISH: {name}")
+        for name in report.probe_defects:
+            w(f"    ** OUR PROBE FAILED: {name}")
         w("")
         w("  These credentials can change the customer's POS database. That")
         w("  is the one thing this product promises cannot happen.")
+        w("  Change nothing. Photograph this screen and call.")
+    elif report.probe_defects and not report.inconclusive:
+        # 🔴 Our bug. Still blocks the install — failing closed is correct
+        # and has not been relaxed — but it must not be reported as a
+        # finding about the customer's login. Saying "your credentials are
+        # unsafe" when our own SQL was malformed is a confident wrong
+        # answer, which is the failure this product exists to prevent.
+        w("  VERDICT: CANNOT VERIFY - OUR PROBE IS AT FAULT, NOT THIS LOGIN")
+        for name in report.probe_defects:
+            w(f"    ** {name}")
+        w("")
+        w("  Every probe that did run was refused, and no dangerous")
+        w("  permission is held. Nothing here suggests the login can write.")
+        w("  But this tool could not construct a valid write for this")
+        w("  schema, so it will not claim the POS is read-only either.")
+        w("")
+        w("  The install is blocked deliberately. Send this block and the")
+        w("  diagnostics zip - this is fixable from our side, and it does")
+        w("  NOT mean anything is wrong with this machine.")
+    else:
+        w("  VERDICT: COULD NOT ESTABLISH READ-ONLY - DO NOT INSTALL")
+        for name in report.inconclusive:
+            w(f"    ?? COULD NOT ESTABLISH: {name}")
+        for name in report.probe_defects:
+            w(f"    ** OUR PROBE FAILED: {name}")
+        w("")
+        w("  No write was permitted, but at least one could not be shown to")
+        w("  be refused. 'We could not tell' and 'it is refused' must never")
+        w("  produce the same outcome, so this blocks the install.")
         w("  Change nothing. Photograph this screen and call.")
     w("=" * width)
     return "\n".join(out)
 
 
 def _wrap(text: str, width: int) -> str:
-    """One line, trimmed. The full text is in the transcript file; the
-    screen only has to be readable."""
+    """One line, trimmed. Kept for the ASKED section, where the text is our
+    own prose and losing the tail costs nothing."""
     flat = " ".join(text.split())
     return flat if len(flat) <= width else flat[:width - 3] + "..."
+
+
+def _fold(text: str, width: int) -> list[str]:
+    """Wrap onto as many lines as it takes, losing nothing.
+
+    🔴 Replaces the truncation that destroyed the evidence. The customer's
+    report showed `[42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...`
+    — every SQL Server error message puts its number near the END, so
+    trimming the tail removed the only part that mattered. Server error text
+    is never truncated again.
+    """
+    words = " ".join(text.split()).split(" ")
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(current)
+    return lines or [""]

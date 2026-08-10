@@ -130,3 +130,13 @@ becomes a parse error at a line that looks fine.
 ```bash
 pytest -q test_golden.py    # must print: 31 passed
 ```
+
+## Deferred, on purpose
+
+| Item | Status | Why |
+|---|---|---|
+| PyInstaller single executable | **DEFERRED** (2026-08-09, reaffirmed 2026-08-10) | Not to be attempted before the site visit. **Unevaluated** — two investigations were dispatched and both died before returning. What exists is *priors, not findings*: `test_golden.py` runs **on the customer machine** as acceptance evidence and `MANIFEST.txt` checks 24 files individually, and one opaque binary weakens both before the antivirus question is even reached. Reopen after the visit, with measurements. |
+| `config.json` from an interactive prompt | **DEFERRED**, same decision | Moves the risk rather than removing it: pasting a 279-character JWT into a Windows console is its own failure mode, and `Config.load` already catches every typo class it would prevent. |
+| `monitor_ro.sql` | **Written, deliberately not applied** | The login works and `readonly_probe.py` proves its behaviour empirically at every install — stronger than a file recording intent. Applying a permissions script to a working login the day before a visit risks the one thing that cannot be debugged remotely. Apply it for customer #2, from the start. |
+
+Neither of the first two is closed. They are open and parked, with the reason recorded.

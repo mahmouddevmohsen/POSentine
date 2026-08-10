@@ -577,3 +577,57 @@ def test_a_ship_folder_still_uses_its_manifest(tmp_path):
     (shipped / "MANIFEST.txt").write_bytes(
         (hashlib.sha256(body).hexdigest() + "  agent.py\n").encode())
     assert P.verify_manifest(shipped).startswith("code integrity   OK — 1 files")
+
+
+def test_the_release_artifact_carries_its_own_manifest(tmp_path):
+    """🔴 The customer installed from a GitHub ZIP of the repository:
+    C:/Users/Techno/Downloads/POSentine-main. A ZIP has no `.git`,
+    and `ship/` is gitignored so the ZIP had no `MANIFEST.txt` either —
+    both integrity mechanisms were absent on the one path the operator
+    actually took, and the install ran with `NOT VERIFIED`.
+
+    The release artifact is the fix: the download IS the verified folder.
+    """
+    import zipfile
+    import make_ship as S
+
+    S.build()
+    archive = S.make_zip()
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            names = zf.namelist()
+            zf.extractall(tmp_path)
+        assert any(n.endswith("posentine/MANIFEST.txt") for n in names), names
+
+        unpacked = tmp_path / "posentine"
+        assert not (unpacked / ".git").exists(), "the point is that there is no .git"
+        status = P.verify_manifest(unpacked)
+        assert status.startswith("code integrity   OK"), status
+        assert "MANIFEST.txt" in status
+
+        # And it must still catch tampering after download.
+        (unpacked / "agent.py").write_bytes(b"# tampered\n")
+        with pytest.raises(P.Stop):
+            P.verify_manifest(unpacked)
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+def test_the_release_artifact_does_not_carry_the_repository():
+    """A repo ZIP puts fake_adapter.py, the whole test suite and our
+    correspondence with the architect on the customer's till. The release
+    artifact is ship/ and nothing else."""
+    import zipfile
+    import make_ship as S
+
+    S.build()
+    archive = S.make_zip()
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            names = "\n".join(zf.namelist())
+        assert "fake_adapter" not in names, "synthetic data must not ship"
+        assert "TO_CLAUDE_CODE" not in names and "FROM_CLAUDE_CODE" not in names
+        assert "test_agent" not in names and "test_preflight" not in names
+        assert "test_golden.py" in names, "the on-site baseline must still ship"
+    finally:
+        archive.unlink(missing_ok=True)

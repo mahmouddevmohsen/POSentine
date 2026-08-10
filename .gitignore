@@ -41,3 +41,11 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+
+# ── The release artifact — built, never committed ───────────────
+# `python make_ship.py --zip` produces this from ship/. It is what the
+# operator downloads, and it carries MANIFEST.txt so a ZIP install is
+# integrity-checked exactly like a clone. Attach it to a GitHub Release;
+# committing it would be a second copy of the code, which is the whole
+# thing ship/ exists to avoid.
+posentine-*.zip

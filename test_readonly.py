@@ -249,7 +249,9 @@ def test_write_sql_lives_in_exactly_one_file():
 def test_every_attempted_write_probe_is_zero_row_by_construction():
     """The probes point at a live restaurant's sales table. Each one must
     be unable to change anything even if the server permits it."""
-    probes = readonly_probe.write_probes()
+    probes = readonly_probe.write_probes(
+        {"dbo.Sales": "saltot", "dbo.SalesDe": "saleprice",
+                              "dbo.Items": "itsaleprice"})
     assert probes, "no write probes — the read-only proof stopped proving"
     for probe in probes:
         assert "WHERE 1 = 0" in probe.sql, (
@@ -259,7 +261,9 @@ def test_every_attempted_write_probe_is_zero_row_by_construction():
 def test_no_probe_can_empty_or_alter_a_table():
     """TRUNCATE takes no WHERE clause and ALTER changes their live schema.
     Neither may ever be attempted — both are interrogated instead."""
-    for probe in readonly_probe.write_probes():
+    for probe in readonly_probe.write_probes(
+        {"dbo.Sales": "saltot", "dbo.SalesDe": "saleprice",
+                              "dbo.Items": "itsaleprice"}):
         words = {w.upper() for w in sqlguard._WORD.findall(probe.sql)}
         assert "TRUNCATE" not in words, probe.sql
         assert "ALTER" not in words, probe.sql
@@ -276,7 +280,9 @@ def test_an_inconclusive_answer_is_not_a_pass():
     outcome. That equivalence is this product's whole failure mode."""
     report = readonly_probe.Report()
     report.writes = [readonly_probe.ProbeResult(
-        readonly_probe.write_probes()[0], readonly_probe.INCONCLUSIVE)]
+        readonly_probe.write_probes(
+        {"dbo.Sales": "saltot", "dbo.SalesDe": "saleprice",
+                              "dbo.Items": "itsaleprice"})[0], readonly_probe.INCONCLUSIVE)]
     report.permissions = [readonly_probe.PermissionAnswer(
         "ALTER dbo.Sales", "'dbo.Sales'", "ALTER", None, "unknown")]
     assert not report.passed
@@ -285,7 +291,9 @@ def test_an_inconclusive_answer_is_not_a_pass():
 def test_a_permitted_write_fails_the_report():
     report = readonly_probe.Report()
     report.writes = [readonly_probe.ProbeResult(
-        readonly_probe.write_probes()[0], readonly_probe.PERMITTED)]
+        readonly_probe.write_probes(
+        {"dbo.Sales": "saltot", "dbo.SalesDe": "saleprice",
+                              "dbo.Items": "itsaleprice"})[0], readonly_probe.PERMITTED)]
     report.permissions = [readonly_probe.PermissionAnswer(
         "ALTER dbo.Sales", "'dbo.Sales'", "ALTER", False, "")]
     assert not report.passed
@@ -303,7 +311,9 @@ def test_a_fully_refused_report_passes():
     report.writes = [readonly_probe.ProbeResult(p, readonly_probe.REFUSED,
                                                 "42000", 229,
                                                 "The UPDATE permission was denied")
-                     for p in readonly_probe.write_probes()]
+                     for p in readonly_probe.write_probes(
+        {"dbo.Sales": "saltot", "dbo.SalesDe": "saleprice",
+                              "dbo.Items": "itsaleprice"})]
     report.permissions = [
         readonly_probe.PermissionAnswer(name, sec, perm, False, why)
         for name, sec, _klass, perm, why in readonly_probe.permission_checks()]
@@ -518,3 +528,211 @@ def test_the_agent_would_report_an_unwired_guard():
     install transcript rather than assumed — never silently absent."""
     report = readonly_probe.Report(guard_wired=False)
     assert "NOT WIRED" in readonly_probe.format_report(report)
+
+
+# ════════════════════════════════════════════════════════════════
+# 6) the identity-column defect — a false NOT READ-ONLY on a real machine
+# ════════════════════════════════════════════════════════════════
+#
+# On 2026-08-10 the probe blocked a correct install at a customer site. All
+# three UPDATE probes targeted the primary keys — salid, saledeid, Itid —
+# and all three are IDENTITY columns. SQL Server refuses to update an
+# identity column WHATEVER permissions you hold (Msg 8102), so the probe
+# could not tell "denied" from "impossible", returned INCONCLUSIVE, and the
+# aggregate failed closed.
+#
+# Failing closed was right. The probe was wrong. These tests exist so that
+# neither half of that can come back.
+
+STRUCTURAL_MSG_8102 = (
+    "42000",
+    "[42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL Server]Cannot "
+    "update identity column 'salid'. (8102) (SQLExecDirectW)")
+
+PERMISSION_MSG_229 = (
+    "42000",
+    "[42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL Server]The UPDATE "
+    "permission was denied on object 'Sales', database 'HD_Rest_Cashier', "
+    "schema 'dbo'. (229) (SQLExecDirectW)")
+
+
+def test_msg_8102_is_a_probe_defect_never_evidence_that_writing_is_allowed():
+    """🔴 The exact fixture the failure demanded.
+
+    An identity refusal must never read as "the server let us write", and
+    must never read as "the server refused us on permissions" either. It
+    means our SQL was wrong for this schema.
+    """
+    verdict, reason = readonly_probe.classify(
+        STRUCTURAL_MSG_8102[0], 8102, STRUCTURAL_MSG_8102[1])
+    assert verdict == readonly_probe.PROBE_DEFECT
+    assert verdict != readonly_probe.PERMITTED
+    assert verdict != readonly_probe.REFUSED
+    assert "8102" in reason
+    assert "IDENTITY" in reason
+    assert "defect in our probe" in reason
+
+
+@pytest.mark.parametrize("native", sorted(readonly_probe.STRUCTURAL_NATIVE))
+def test_every_structural_refusal_is_a_probe_defect(native):
+    """8102 was the one that bit. 544, 271 and 272 are the same trap one
+    statement over — an identity INSERT, a computed column, a rowversion."""
+    verdict, reason = readonly_probe.classify("42000", native, "structural")
+    assert verdict == readonly_probe.PROBE_DEFECT
+    assert str(native) in reason
+
+
+def test_a_permission_refusal_is_still_a_pass():
+    """The falsifier for the test above: if structural detection swallowed
+    real permission denials, the probe would stop proving anything."""
+    verdict, reason = readonly_probe.classify(
+        PERMISSION_MSG_229[0], 229, PERMISSION_MSG_229[1])
+    assert verdict == readonly_probe.REFUSED
+    assert reason == ""
+
+
+def _clean_permissions():
+    return [readonly_probe.PermissionAnswer(name, sec, perm, False, why)
+            for name, sec, _k, perm, why in readonly_probe.permission_checks()]
+
+
+def test_a_probe_defect_blocks_the_install():
+    """Failing closed was correct behaviour and has NOT been relaxed."""
+    report = readonly_probe.Report(identity={"login_name": "monitor_ro"})
+    report.writes = [readonly_probe.ProbeResult(
+        readonly_probe.Probe("UPDATE dbo.Sales", "UPDATE ...", ""),
+        readonly_probe.PROBE_DEFECT, "42000", 8102, "", "identity")]
+    report.permissions = _clean_permissions()
+    assert not report.passed
+
+
+def test_a_probe_defect_does_not_accuse_the_customers_credentials():
+    """🔴 The half that made the site failure expensive.
+
+    The machine was told "These credentials can change the customer's POS
+    database" when every probe that ran was refused and no dangerous
+    permission was held. Our SQL was malformed. Blocking was right; that
+    sentence was a confident wrong answer.
+    """
+    report = readonly_probe.Report(identity={"login_name": "monitor_ro"})
+    report.writes = [
+        readonly_probe.ProbeResult(
+            readonly_probe.Probe("UPDATE dbo.Sales", "UPDATE ...", ""),
+            readonly_probe.PROBE_DEFECT, "42000", 8102, "", "identity"),
+        readonly_probe.ProbeResult(
+            readonly_probe.Probe("DELETE dbo.Sales", "DELETE ...", ""),
+            readonly_probe.REFUSED, "42000", 229, "denied"),
+    ]
+    report.permissions = _clean_permissions()
+
+    text = readonly_probe.format_report(report)
+    assert not report.passed, "it must still block the install"
+    assert "OUR PROBE IS AT FAULT" in text
+    assert "These credentials can change" not in text
+    assert "NOT READ-ONLY" not in text
+
+
+def test_a_permitted_write_still_says_the_credentials_are_unsafe():
+    """The falsifier: the accusing wording must survive where it is true."""
+    report = readonly_probe.Report(identity={"login_name": "monitor_ro"})
+    report.writes = [readonly_probe.ProbeResult(
+        readonly_probe.Probe("UPDATE dbo.Sales", "UPDATE ...", "can modify rows"),
+        readonly_probe.PERMITTED)]
+    report.permissions = _clean_permissions()
+    text = readonly_probe.format_report(report)
+    assert "NOT READ-ONLY" in text
+    assert "These credentials can change" in text
+
+
+def test_no_write_probe_targets_an_identity_or_computed_column():
+    """🔴 The structural guarantee. Probe columns are discovered by querying
+    sys.columns for is_identity = 0 AND is_computed = 0, so a column that
+    cannot be written is never chosen — and this fails if anyone
+    reintroduces a hardcoded key."""
+    source = (HERE / "readonly_probe.py").read_text(encoding="utf-8")
+    assert "is_identity = 0" in source, "identity columns are no longer excluded"
+    assert "is_computed = 0" in source, "computed columns are no longer excluded"
+
+    probes = readonly_probe.write_probes(
+        {"dbo.Sales": "saltot", "dbo.SalesDe": "saleprice",
+         "dbo.Items": "itsaleprice"})
+    for probe in probes:
+        for identity_column in ("salid", "saledeid", "Itid"):
+            assert f"SET {identity_column} =" not in probe.sql, probe.sql
+            assert f"({identity_column})" not in probe.sql, probe.sql
+
+
+def test_write_probes_cannot_be_built_without_asking_the_server():
+    """No default argument: a default would be a hardcoded schema, and a
+    hardcoded schema is precisely the bug."""
+    import inspect
+    signature = inspect.signature(readonly_probe.write_probes)
+    columns = signature.parameters["columns"]
+    assert columns.default is inspect.Parameter.empty, (
+        "write_probes() grew a default schema again")
+
+
+def test_the_discovery_query_excludes_every_unwritable_column_kind():
+    sql = readonly_probe.PROBEABLE_COLUMN_SQL
+    for guard in ("is_identity = 0", "is_computed = 0", "is_rowguidcol = 0",
+                  "timestamp", "rowversion"):
+        assert guard in sql, guard
+    # It is a read, so the SQL guard must accept it.
+    sqlguard.assert_read_only(sql.replace("?", "'x'"))
+
+
+def test_a_table_with_no_writable_column_is_a_limitation_not_a_pass():
+    """"No probeable column" must never read as "writing is denied"."""
+    def must_not_be_called():
+        raise AssertionError("a probe with no column must never be sent")
+
+    probes = [p for p in readonly_probe.write_probes({"dbo.OnlyIdentity": None})
+              if "DELETE" not in p.name]
+    results = readonly_probe.run_write_probes(must_not_be_called, probes)
+
+    assert results
+    assert all(r.verdict == readonly_probe.NO_PROBEABLE_COLUMN for r in results)
+    for r in results:
+        assert "NOT evidence that writing is permitted" in r.reason
+
+    report = readonly_probe.Report()
+    report.writes = results
+    report.permissions = _clean_permissions()
+    assert not report.passed
+
+
+def test_the_sql_server_error_number_is_never_truncated_away():
+    """🔴 The customer's report showed
+    `[42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...` — the number
+    lives near the END of a SQL Server message, so trimming the tail removed
+    the one fact that would have settled this in seconds."""
+    report = readonly_probe.Report(identity={"login_name": "monitor_ro"})
+    report.writes = [readonly_probe.ProbeResult(
+        readonly_probe.Probe("UPDATE dbo.Sales", "UPDATE ...", ""),
+        readonly_probe.PROBE_DEFECT, STRUCTURAL_MSG_8102[0], 8102,
+        STRUCTURAL_MSG_8102[1], "Msg 8102: identity")]
+    report.permissions = []
+
+    text = readonly_probe.format_report(report)
+    assert "Msg 8102" in text
+    assert "SQLSTATE 42000" in text
+    assert "Cannot update identity column" in text, "the message was truncated"
+
+
+def test_every_non_refused_verdict_states_why():
+    for sqlstate, native, message in (("42000", 8102, "identity"),
+                                      ("42000", 9999, "something else")):
+        verdict, reason = readonly_probe.classify(sqlstate, native, message)
+        assert verdict != readonly_probe.REFUSED
+        assert reason, f"{verdict} gave no reason"
+
+
+def test_effective_permissions_are_shown_distinct():
+    """fn_my_permissions returns one row per column: the customer's report
+    printed SELECT 46 times, and confirming UPDATE was absent meant reading
+    46 identical tokens."""
+    report = readonly_probe.Report(identity={"login_name": "monitor_ro"})
+    report.effective = ["SELECT"] * 46
+    text = readonly_probe.format_report(report)
+    assert "SELECT, SELECT" not in text
+    assert "46 rows, one per column" in text

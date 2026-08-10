@@ -17,6 +17,14 @@ Time if nothing goes wrong: ~20 minutes. Budget 45.
 
 ## 0 — The whole thing in one click
 
+> **Download the release zip from GitHub Releases, or `git clone`.**
+> Do **not** use the green "Download ZIP" button on the repository page. A
+> repository ZIP has no `.git` and no `MANIFEST.txt`, so **nothing can
+> confirm this machine is running the code we tested** — step 0 will say
+> `NOT VERIFIED` and mean it. The release zip carries its own manifest and
+> is checked file by file. (This is not hypothetical: the 2026-08-10
+> install ran from a repository ZIP with no integrity check at all.)
+
 ```
 double-click INSTALL.bat
 ```
@@ -202,6 +210,24 @@ one promise this product makes that is not negotiable.
 | `HELD !!` on `ALTER` | The login could empty a table with `TRUNCATE` | **STOP. Call.** |
 | `member of sysadmin` | Permission checks are skipped entirely; every other line above is meaningless | **STOP. Call.** |
 | `INCONCLUSIVE` / `UNKNOWN` | We could not establish refusal. Not a pass. | **STOP. Call.** |
+| `PROBE DEFECT` / `CANNOT VERIFY — OUR PROBE IS AT FAULT` | **Our tool is wrong, not this machine.** It could not build a valid write for this schema. | **STOP, but nothing is wrong here.** Send the block and the diagnostics zip; we fix it from our side. |
+
+> ### On `PROBE DEFECT` — this happened once, on 2026-08-10
+>
+> The three `UPDATE` probes used to target the primary keys, and on the
+> customer's schema all three were **IDENTITY** columns. SQL Server refuses
+> to update an identity column whatever permissions you hold (`Msg 8102`),
+> so the probe could not tell *denied* from *impossible*, and the install
+> was blocked on a machine whose login was perfectly read-only.
+>
+> Blocking was correct — the gate did its job. The probe was wrong.
+> It now asks the server which column it may legally target, and a
+> structural refusal is reported as **our** defect rather than as a finding
+> about the customer's credentials.
+>
+> Every non-refusal now prints the **SQL Server error number** and a `why:`
+> line. `Msg 229` = permission denied (good). `Msg 8102` = identity refusal
+> (our bug).
 
 The full block goes into the install transcript and the diagnostics zip.
 **That transcript is our evidence to the customer.** See

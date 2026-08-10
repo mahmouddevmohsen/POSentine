@@ -1,0 +1,464 @@
+=== POSentine session log ===
+started: 2026-08-10T16:08:38+03:00
+task: RESUME_PROMPT.md — identity-column probe defect
+
+### STEP 1 — RE-ORIENT ###
+
+--- git log --oneline -15 ---
+467fa89 docs: pre-visit checks - token proven live, sync_state row confirmed, preflight does not exercise the token
+b4a9188 docs: architect's pre-visit check list
+2bd5b7d docs: fold the rehearsed-vs-final diffstat into the sign-off
+6b999ca docs: final sign-off - last run, and the ranked risk list for the visit
+d38eb24 docs: architect's final sign-off note
+e68d64b docs: final report and handover
+3e804bc fix: an empty task_info.txt and 'no task registered' read identically
+f33fa8a fix: a fresh clone had no integrity check at all
+07b922c fix: the import-closure test was not transitive, and VERIFY.md step 7 was wrong twice
+885365f docs: reply to the architect - Priority Zero, the task defect, and an honest gap list
+2fafad5 feat: prove read-only on the POS, and fold the install into one click
+5926951 fix: refuse to build ship/ from a working tree a checkout would not produce
+58a0788 feat: register the scheduled task (VERIFY.md step 7)
+ebd94ae feat: bundle VERIFY.md steps 1-4 into preflight.bat, and a ship/ folder
+bbba575 fix: decide first-run against the cloud, not against state.json
+
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.session_log_path
+	README.txt
+	cloud.txt
+	config.redacted.json
+	diagnostics_20260810_055802/
+	folder.txt
+	install_logs/
+	logs/
+	manifest_check.txt
+	odbc.txt
+	readonly_proof.txt
+	task.xml
+	task_info.txt
+	versions.txt
+
+nothing added to commit but untracked files present (use "git add" to track)
+
+--- branch vs origin ---
+fatal: Needed a single revision
+
+--- are the diagnostics files in git history? (must be NO - customer data) ---
+  readonly_proof.txt         never committed - clean
+  cloud.txt                  never committed - clean
+  config.redacted.json       never committed - clean
+  manifest_check.txt         never committed - clean
+  task.xml                   never committed - clean
+
+--- diagnostics dir tracked? ---
+  (empty above = untracked, correct)
+
+--- when did these appear? ---
+-rw-r--r-- 1 mahmo 197609 3980 2026-08-10T06:08 readonly_proof.txt
+
+diagnostics_20260810_055802:
+total 38
+drwxr-xr-x 1 mahmo 197609    0 2026-08-10T06:10 .
+drwxr-xr-x 1 mahmo 197609    0 2026-08-10T16:09 ..
+-rw-r--r-- 1 mahmo 197609  846 2026-08-10T06:09 cloud.txt
+-rw-r--r-- 1 mahmo 197609  612 2026-08-10T06:09 config.redacted.json
+-rw-r--r-- 1 mahmo 197609 2878 2026-08-10T06:09 folder.txt
+drwxr-xr-x 1 mahmo 197609    0 2026-08-10T06:10 install_logs
+-rw-r--r-- 1 mahmo 197609   87 2026-08-10T06:09 manifest_check.txt
+-rw-r--r-- 1 mahmo 197609  294 2026-08-10T06:09 odbc.txt
+-rw-r--r-- 1 mahmo 197609  410 2026-08-10T06:09 README.txt
+-rw-r--r-- 1 mahmo 197609 3980 2026-08-10T06:09 readonly_proof.txt
+-rw-r--r-- 1 mahmo 197609  203 2026-08-10T06:09 task.xml
+-rw-r--r-- 1 mahmo 197609  203 2026-08-10T06:09 task_info.txt
+-rw-r--r-- 1 mahmo 197609  579 2026-08-10T06:09 versions.txt
+
+--- origin/main ---
+467fa89
+467fa89f6bcfb1e3d5cd3dc9b0f14442b08fb1c2	refs/heads/main
+
+--- TO_CLAUDE_CODE.md: unchanged since 467fa89? ---
+  (no diff = the resume prompt in Docs/ is the live instruction)
+
+--- head of TO_CLAUDE_CODE.md ---
+# Review — from the architect
+
+> Protocol: I write here, you reply in `FROM_CLAUDE_CODE.md`.
+
+---
+
+# 2026-08-10 — one last targeted check. Three unknowns, nothing else.
+
+
+############ PRIMARY EVIDENCE — the customer machine's own readonly_proof.txt ############
+==================================================================
+  READ-ONLY PROOF - attempting to write to the POS, and requiring
+  every attempt to be refused
+==================================================================
+  login              monitor_ro
+  database user      monitor_ro
+  database           HD_Rest_Cashier
+
+  sysadmin           no
+  db_owner           no
+  db_ddladmin        no
+  db_datawriter      no
+  db_denydatawriter  yes
+  db_datareader      yes
+
+  sqlguard choke point  ACTIVE
+
+  --------------------------------------------------------------
+  ATTEMPTED - each of these was actually sent to the POS
+  --------------------------------------------------------------
+    INCONCLUSIVE  UPDATE dbo.Sales
+      UPDATE dbo.Sales SET salid = salid WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    REFUSED       DELETE dbo.Sales
+      DELETE FROM dbo.Sales WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    REFUSED       INSERT dbo.Sales
+      INSERT INTO dbo.Sales (salid) SELECT salid FROM dbo.Sales WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    INCONCLUSIVE  UPDATE dbo.SalesDe
+      UPDATE dbo.SalesDe SET saledeid = saledeid WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    REFUSED       DELETE dbo.SalesDe
+      DELETE FROM dbo.SalesDe WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    REFUSED       INSERT dbo.SalesDe
+      INSERT INTO dbo.SalesDe (saledeid) SELECT saledeid FROM dbo.SalesDe WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    INCONCLUSIVE  UPDATE dbo.Items
+      UPDATE dbo.Items SET Itid = Itid WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    REFUSED       DELETE dbo.Items
+      DELETE FROM dbo.Items WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+    REFUSED       INSERT dbo.Items
+      INSERT INTO dbo.Items (Itid) SELECT Itid FROM dbo.Items WHERE 1 = 0
+      -> [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ...
+
+  --------------------------------------------------------------
+  ASKED - never attempted; there is no harmless version of these
+  --------------------------------------------------------------
+    not held      ALTER dbo.Sales  (ALTER)
+    not held      CONTROL dbo.Sales  (CONTROL)
+    not held      REFERENCES dbo.Sales  (REFERENCES)
+    not held      ALTER dbo.SalesDe  (ALTER)
+    not held      CONTROL dbo.SalesDe  (CONTROL)
+    not held      REFERENCES dbo.SalesDe  (REFERENCES)
+    not held      ALTER dbo.Items  (ALTER)
+    not held      CONTROL dbo.Items  (CONTROL)
+    not held      REFERENCES dbo.Items  (REFERENCES)
+    not held      CREATE TABLE in the database  (CREATE TABLE)
+    not held      ALTER the database  (ALTER)
+    not held      BACKUP the database  (BACKUP DATABASE)
+    not held      CONTROL the server  (CONTROL SERVER)
+
+  --------------------------------------------------------------
+  Everything this login may do to dbo.Sales, per the server:
+  --------------------------------------------------------------
+    SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT, SELECT
+
+  VERDICT: NOT READ-ONLY — DO NOT INSTALL
+    ?? COULD NOT ESTABLISH: UPDATE dbo.Sales
+    ?? COULD NOT ESTABLISH: UPDATE dbo.SalesDe
+    ?? COULD NOT ESTABLISH: UPDATE dbo.Items
+
+  These credentials can change the customer's POS database. That
+  is the one thing this product promises cannot happen.
+  Change nothing. Photograph this screen and call.
+==================================================================
+--- full suite ---
+........................................................................ [ 69%]
+........................................................................ [ 92%]
+.......................                                                  [100%]
+311 passed in 6.34s
+
+--- golden ---
+...............................                                          [100%]
+31 passed in 0.06s
+
+--- manifest_check.txt (STEP 3) ---
+code integrity   NOT VERIFIED — no MANIFEST.txt, and this is not a clean git checkout
+--- versions.txt ---
+collected           2026-08-10T05:58:02
+python              3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]
+python executable   C:\Users\Techno\AppData\Local\Programs\Python\Python312\python.exe
+platform            Windows-10-10.0.19045-SP0
+machine             AMD64
+folder              C:\Users\Techno\Downloads\POSentine-main
+
+--- pip freeze ---
+certifi==2026.7.22
+charset-normalizer==3.4.9
+colorama==0.4.6
+idna==3.18
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.20.0
+pyodbc==5.3.0
+pytest==9.1.1
+requests==2.34.2
+urllib3==2.7.0
+
+--- odbc.txt ---
+pyodbc 5.3.0
+drivers:
+    SQL Server
+    Microsoft Access Driver (*.mdb, *.accdb)
+    Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)
+    Microsoft Access Text Driver (*.txt, *.csv)
+    SQL Server Native Client 11.0
+    ODBC Driver 11 for SQL Server
+picked ODBC Driver 11 for SQL Server
+
+### STEP 2 — full suite after the fix ###
+........................................................................ [ 22%]
+........................................................................ [ 44%]
+........................................................................ [ 66%]
+........................................................................ [ 88%]
+.......................................                                  [100%]
+327 passed in 5.60s
+
+--- golden ---
+...............................                                          [100%]
+31 passed in 0.06s
+
+### STEP 2 — reproduction against the customer's schema ###
+######################################################################
+#  A. THE CUSTOMER'S MACHINE, WITH THE FIX
+######################################################################
+==================================================================
+  READ-ONLY PROOF - attempting to write to the POS, and requiring
+  every attempt to be refused
+==================================================================
+  login              monitor_ro
+  database user      monitor_ro
+  database           HD_Rest_Cashier
+
+  sysadmin           no
+  db_owner           no
+  db_ddladmin        no
+  db_datawriter      no
+  db_denydatawriter  yes
+  db_datareader      yes
+
+  sqlguard choke point  ACTIVE
+
+  --------------------------------------------------------------
+  COLUMN CHOSEN FOR EACH WRITE PROBE (asked of the server, not assumed)
+  --------------------------------------------------------------
+    dbo.Sales        saltot   (not identity, not computed)
+    dbo.SalesDe      saleprice   (not identity, not computed)
+    dbo.Items        itsaleprice   (not identity, not computed)
+
+  --------------------------------------------------------------
+  ATTEMPTED - each of these was actually sent to the POS
+  --------------------------------------------------------------
+    REFUSED              UPDATE dbo.Sales
+      UPDATE dbo.Sales SET saltot = saltot WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The UPDATE permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              INSERT dbo.Sales
+      INSERT INTO dbo.Sales (saltot) SELECT saltot FROM dbo.Sales WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The INSERT permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              DELETE dbo.Sales
+      DELETE FROM dbo.Sales WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The DELETE permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              UPDATE dbo.SalesDe
+      UPDATE dbo.SalesDe SET saleprice = saleprice WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The UPDATE permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              INSERT dbo.SalesDe
+      INSERT INTO dbo.SalesDe (saleprice) SELECT saleprice FROM dbo.SalesDe WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The INSERT permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              DELETE dbo.SalesDe
+      DELETE FROM dbo.SalesDe WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The DELETE permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              UPDATE dbo.Items
+      UPDATE dbo.Items SET itsaleprice = itsaleprice WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The UPDATE permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              INSERT dbo.Items
+      INSERT INTO dbo.Items (itsaleprice) SELECT itsaleprice FROM dbo.Items WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The INSERT permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+    REFUSED              DELETE dbo.Items
+      DELETE FROM dbo.Items WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The DELETE permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+
+  --------------------------------------------------------------
+  ASKED - never attempted; there is no harmless version of these
+  --------------------------------------------------------------
+    not held      ALTER dbo.Sales  (ALTER)
+    not held      CONTROL dbo.Sales  (CONTROL)
+    not held      REFERENCES dbo.Sales  (REFERENCES)
+    not held      ALTER dbo.SalesDe  (ALTER)
+    not held      CONTROL dbo.SalesDe  (CONTROL)
+    not held      REFERENCES dbo.SalesDe  (REFERENCES)
+    not held      ALTER dbo.Items  (ALTER)
+    not held      CONTROL dbo.Items  (CONTROL)
+    not held      REFERENCES dbo.Items  (REFERENCES)
+    not held      CREATE TABLE in the database 
+### STEP 3 — evidence for the ZIP/integrity decision ###
+customer folder was: folder              C:\Users\Techno\Downloads\POSentine-main
+manifest_check said: code integrity   NOT VERIFIED — no MANIFEST.txt, and this is not a clean git checkout
+
+--- is ship/ committed (would a ZIP contain MANIFEST.txt)? ---
+27:ship/
+  => ship/ is gitignored, so a GitHub ZIP of the repo cannot contain MANIFEST.txt
+
+--- how many files would a Release asset have to carry? ---
+24
+
+### STEP 3 — build the release artifact ###
+    Step 9 (go-live) is two SQL statements run from our side,
+    not on this machine, and is deliberately not in here.
+==================================================================
+
+  release artifact: posentine-467fa89f6bcf.zip  (125 KB)
+  Attach this to a GitHub Release. It is what the operator
+  downloads — it carries MANIFEST.txt, so a ZIP install is
+  integrity-checked exactly like a clone.
+
+--- what is inside it? ---
+posentine-467fa89f6bcf.zip: 26 files
+  MANIFEST.txt present: True
+  fake_adapter present: False (must be False)
+  tests present       : False (must be False)
+  correspondence      : False (must be False)
+  built from: ['# sha256 of every file in this folder, as built from the repository.', '# built from: 467fa89f6bcfb1e3d5cd3dc9b0f14442b08fb1c2 +uncommitted changes']
+
+--- unpack the artifact somewhere with no .git, as the operator would ---
+extracted posentine-467fa89f6bcf.zip
+  .git present: no
+
+--- integrity check on the unpacked ZIP ---
+  code integrity   OK � 25 files match MANIFEST.txt
+
+--- and if a file is edited after download? ---
+  STOPPED: files differ from the versions we verified: ['agent.py']
+[1m[31mE               ^[0m
+[1m[31mE   SyntaxError: unterminated string literal (detected at line 627)[0m
+=========================== short test summary info ===========================
+ERROR test_preflight.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.24s
+
+### full suite ###
+=========================== short test summary info ===========================
+ERROR test_preflight.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.45s
+
+### golden ###
+...............................                                          [100%]
+31 passed in 0.06s
+[1m[31mE          ^[0m
+[1m[31mE   SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in position 78-79: truncated \UXXXXXXXX escape[0m
+=========================== short test summary info ===========================
+ERROR test_preflight.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.25s
+
+### full suite ###
+=========================== short test summary info ===========================
+ERROR test_preflight.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.44s
+
+### golden ###
+...............................                                          [100%]
+31 passed in 0.06s
+
+### locked files ###
+adapter_hdsoft.py
+  (only the sqlguard wiring, already committed by the architect)
+..                                                                       [100%]
+2 passed, 56 deselected in 0.96s
+
+### full suite ###
+........................................................................ [ 65%]
+........................................................................ [ 87%]
+.........................................                                [100%]
+329 passed in 6.19s
+
+### golden ###
+...............................                                          [100%]
+31 passed in 0.06s
+
+### STEP 4 — the open task, recorded as DEFERRED ###
+Recorded in the session task list, and written into the repo below.
+
+### final verification before commit ###
+ship/ rebuilt
+........................................................................ [ 87%]
+.........................................                                [100%]
+329 passed in 6.42s
+...............................                                          [100%]
+31 passed in 0.06s
+
+--- files changed this session ---
+ M .gitignore
+ M README.md
+ M VERIFY.md
+ M make_ship.py
+ M preflight.py
+ M readonly_probe.py
+ M test_preflight.py
+ M test_readonly.py
+?? logs/
