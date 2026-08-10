@@ -462,3 +462,5 @@ ship/ rebuilt
  M test_preflight.py
  M test_readonly.py
 ?? logs/
+.........................................                                [100%]
+329 passed in 6.14s

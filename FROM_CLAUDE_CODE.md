@@ -4,6 +4,248 @@ Newest section at the top.
 
 ---
 
+# 2026-08-10 16:40 UTC — probe fixed, ZIP integrity closed, one thing I did not do
+
+**329 passed** (was 311), `test_golden.py` exactly **31**, no locked file touched.
+Commit `d7ede19`. Session log at `logs/session_20260810_160838.log` — every command and
+every failure, per your rule 2.
+
+---
+
+## STEP 1 — state, before I changed anything
+
+- **Committed:** `HEAD = origin/main = 467fa89`, clean tree, nothing unpushed.
+- **In progress:** nothing half-finished. Untracked were the customer's unpacked
+  diagnostics. **I checked specifically: no diagnostics file was ever committed**, so no
+  customer data reached the repo or GitHub. They are still untracked and I left them that
+  way — they carry the till's username and folder layout.
+- **Broken:** the probe defect, exactly as you diagnosed.
+
+Two things the bundle showed that your note did not name, and both matter:
+
+**The truncation had a specific cause.** `_wrap(message, width - 10)` in `format_report`.
+SQL Server puts the error number near the **end** of the message, so trimming the tail
+removed precisely the part that identifies it. That is why you got
+`...[SQ...` instead of `(8102)`.
+
+**`fn_my_permissions` returns one row per column**, so the report printed `SELECT` 46
+times. Establishing that UPDATE was absent meant reading 46 identical tokens.
+
+---
+
+## STEP 2 — the fix, all four parts
+
+### (a) + (b) The column is asked for, not assumed
+
+```sql
+SELECT TOP 1 c.name
+  FROM sys.columns c
+  JOIN sys.tables tb ON tb.object_id = c.object_id
+  JOIN sys.schemas sc ON sc.schema_id = tb.schema_id
+  JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+ WHERE sc.name = ? AND tb.name = ?
+   AND c.is_identity = 0
+   AND c.is_computed = 0
+   AND c.is_rowguidcol = 0
+   AND ty.name NOT IN ('timestamp', 'rowversion')
+ ORDER BY c.column_id
+```
+
+`rowguidcol` and `rowversion` are in there because they fail the same way for the same
+reason (Msg 272), and finding that out on customer #2 would be this bug again wearing a
+different number.
+
+`write_probes(columns)` takes the mapping as a **required** argument. A default would be
+a hardcoded schema, and a hardcoded schema is the bug — there is a test that fails if
+anyone gives it one back.
+
+**A table with no writable column** reports `NO PROBEABLE COLUMN`, blocks the install,
+and says in the report that this is a limitation of the probe and **not** evidence either
+way. It never silently reduces what was tested.
+
+### 🔴 One thing I fixed that you did not ask for, and I want you to overrule it if you disagree
+
+**The INSERT probe had the same defect.** It was
+
+```sql
+INSERT INTO dbo.Sales (salid) SELECT salid FROM dbo.Sales WHERE 1 = 0
+```
+
+`salid` is the identity column. It returned `229` on this machine only because permission
+is checked before the identity rule — **the moment a login actually held INSERT, that
+probe would have returned Msg 544** ("cannot insert an explicit value into an identity
+column") and been INCONCLUSIVE for exactly the reason the UPDATE probes were. It is the
+same bug one statement over, waiting for a customer whose grants are slightly different.
+
+It now uses the same discovered column. One line, same function, and leaving a known twin
+of the bug in place while fixing its sibling did not seem like the smaller change.
+
+### (c) The error number survives, and every non-refusal says why
+
+```
+    REFUSED              UPDATE dbo.Sales
+      UPDATE dbo.Sales SET saltot = saltot WHERE 1 = 0
+      SQLSTATE 42000   Msg 229
+      [42000] [Microsoft][ODBC Driver 11 for SQL Server][SQL
+      Server]The UPDATE permission was denied on object 'Sales',
+      database 'HD_Rest_Cashier', schema 'dbo'. (229)
+      (SQLExecDirectW)
+```
+
+The number is on its own line before the message, so it survives even if the message is
+mangled. `_wrap` is replaced by `_fold` for server text — it wraps onto as many lines as
+it takes and loses nothing.
+
+### (d) The tests
+
+- `Msg 8102/544/271/272` → `PROBE DEFECT`, asserted to be neither `PERMITTED` nor
+  `REFUSED`.
+- A probe defect **still blocks the install** — there is a test asserting `passed is
+  False`, so nobody can "fix" this by relaxing the gate.
+- A probe defect **must not print** `These credentials can change the customer's POS
+  database`, with a paired falsifier asserting that wording **does** appear when a write
+  is genuinely permitted.
+- A test that fails if any probe targets `salid`/`saledeid`/`Itid`.
+- A test that fails if `write_probes()` regrows a default schema.
+- A test that `Msg 229` is still a clean `REFUSED` — without it, structural detection
+  could swallow real permission denials and the probe would stop proving anything.
+
+### The reproduction
+
+Simulated the customer's schema — identity keys raising 8102, everything else raising 229:
+
+```
+A. THE CUSTOMER'S MACHINE, WITH THE FIX
+    dbo.Sales        saltot        (not identity, not computed)
+    dbo.SalesDe      saleprice     (not identity, not computed)
+    dbo.Items        itsaleprice   (not identity, not computed)
+    ... 9 probes, all REFUSED, all Msg 229 ...
+  VERDICT: READ-ONLY CONFIRMED
+  passed = True
+
+B. IF DISCOVERY EVER RETURNED AN IDENTITY COLUMN ANYWAY (Msg 8102)
+  VERDICT: CANNOT VERIFY - OUR PROBE IS AT FAULT, NOT THIS LOGIN
+    ** UPDATE dbo.Sales / dbo.SalesDe / dbo.Items
+    The install is blocked deliberately. Send this block and the
+    diagnostics zip - this is fixable from our side, and it does
+    NOT mean anything is wrong with this machine.
+  passed = False
+  says 'NOT READ-ONLY': False
+```
+
+**A is the install that should have happened yesterday.** B is the belt-and-braces: still
+blocked, still failing closed, but no longer accusing a customer whose credentials were
+fine.
+
+### What I did not do
+
+**I did not touch the aggregate verdict logic.** `passed` still requires every write
+`REFUSED`; `PROBE_DEFECT` and `NO_PROBEABLE_COLUMN` were added to what fails it, not
+removed. The only thing that changed is the *wording* of the failure. You asked me to stop
+if I found myself relaxing the gate — I didn't, and the test named
+`test_a_probe_defect_blocks_the_install` exists so that a future session cannot.
+
+---
+
+## STEP 3 — I recommend **Option B**, and I think the framing of A needs one correction
+
+**Recommendation: B. Implemented.**
+
+The correction: **A does not work for this customer.** They installed from
+`C:\Users\Techno\Downloads\POSentine-main` — a repository ZIP — which means there is no
+git on that till. "Require `git clone`" is not a wording change, it is a **new dependency
+on a machine we do not control, discovered at the counter.** That is the same trade you
+rejected for `monitor_ro.sql`, and I think it fails for the same reason.
+
+There is also a third fact neither option mentioned: today **`NOT VERIFIED` does not stop
+the install.** `verify_manifest` returns it as a status string and preflight prints it and
+carries on. So the customer machine did not merely lack a check — it ran without one and
+said so in passing.
+
+**What I built:** `python make_ship.py --zip` produces the artifact the operator
+downloads.
+
+```
+release artifact: posentine-467fa89f6bcf.zip  (125 KB)
+  MANIFEST.txt present: True
+  fake_adapter present: False
+  tests present       : False
+  correspondence      : False
+  built from: 467fa89f6bcfb1e3d5cd3dc9b0f14442b08fb1c2
+```
+
+Unpacked where there is no `.git`, as the operator would:
+
+```
+  .git present: no
+  code integrity   OK - 25 files match MANIFEST.txt
+
+  and after editing one file:
+  STOPPED: files differ from the versions we verified: ['agent.py']
+```
+
+It also fixes something I flagged at handover and never acted on: a repository ZIP puts
+`fake_adapter.py`, the whole test suite and **our correspondence** on the customer's till.
+This carries 24 files.
+
+Two tests cover it, and the `NOT VERIFIED` wording now names the cause and the fix instead
+of shrugging. `posentine-*.zip` is gitignored — committing it would be a second copy of
+the code, which is what `ship/` exists to prevent.
+
+**One decision I did not make unilaterally, and want from you:** should `NOT VERIFIED`
+become a **hard stop**? It is the safer behaviour and the reason the artifact now exists.
+I left it non-fatal because turning it into a stop would have blocked yesterday's install
+outright, and that is your call to make, not mine to slip into a bug-fix commit.
+
+---
+
+## STEP 4 — the PyInstaller task
+
+**Marked DEFERRED, not closed**, with the reason written into `README.md` so it survives
+this conversation. It records that it is **unevaluated**, that what exists is **priors,
+not findings**, and that both investigations died before returning anything. Your decision
+that it is not to be attempted before the visit is recorded alongside it, as is the
+`monitor_ro.sql` decision.
+
+---
+
+## Rule 5 — the recurring shape, sixth instance
+
+The identity probe is the sixth, and it is the purest one yet: **a check that could not
+fail correctly, because the statement it sent could not succeed for a reason unrelated to
+what it was testing.** It would have returned INCONCLUSIVE on *any* schema with an
+identity primary key, which is nearly all of them — the check was never really testing
+permissions at all.
+
+What the earlier five have in common is that the check shared a source with the thing it
+checked. This one is a variant: **the check shared a failure mode with something that was
+not the subject.** The question that finds it is a sibling of the usual one:
+
+> *If this check failed, would I know why?*
+
+The probe could not answer that, and `INCONCLUSIVE` with a truncated message was the
+symptom. That is why (c) is not cosmetic.
+
+---
+
+## What is still open
+
+- **Your call on whether `NOT VERIFIED` becomes a hard stop.**
+- **Nothing is pushed yet** — the commit is local. Say the word and I push, or push it
+  yourself; I did not want to publish a change to the install path without you seeing it.
+- The release zip is **built but not attached to a GitHub Release.** That is an
+  outward-facing publish and I have not done it.
+- PyInstaller / generated config: deferred, unevaluated.
+- `monitor_ro.sql`: written, deliberately not applied, per your decision.
+
+## What I need from you
+
+1. Hard stop on `NOT VERIFIED`, yes or no.
+2. Whether the INSERT-probe change is in scope or should be reverted.
+3. Whether to push `d7ede19` and cut the Release.
+
+---
+
 # 2026-08-10 02:00 UTC — three checks. All three settle green. Two things to read first.
 
 No code changed. Raw output below.
