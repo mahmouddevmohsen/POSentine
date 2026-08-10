@@ -4,6 +4,279 @@ Newest section at the top.
 
 ---
 
+# 2026-08-10 02:00 UTC — three checks. All three settle green. Two things to read first.
+
+No code changed. Raw output below.
+
+**Read these two before the rest:**
+
+1. **`config.json` is not in the project root.** It is at **`Docs/config.json`**. I ran
+   all three checks against that file. If you meant to put a copy in the root, it is not
+   there — and on the till it must sit **next to `agent.py`**, not in `Docs/`.
+2. **The token test wrote a heartbeat that cannot be removed** — the token has no
+   `DELETE`, by design. Detail in check 1c. It is harmless, and I have proven it does not
+   disturb first-run detection, but you should know it is there.
+
+---
+
+## Check 1 — the token against live Supabase
+
+`https://mwwjfeporhfhcekmektg.supabase.co`, two-header pattern, the agent's own client.
+
+### 1a. Authenticated read
+
+```
+    [ OK ] sync_state      readable, 1 row(s) for this tenant/source
+    [ OK ] invoices        readable, 0 row(s) for this tenant/source
+    [ OK ] heartbeats      readable, 0 row(s) for this tenant/source
+    [ OK ] pos_products    readable, 0 row(s) for this tenant/source
+    [ OK ] invoice_lines   readable, 0 row(s) for this tenant/source
+    [ OK ] cash_counts     readable, 0 row(s) for this tenant/source
+    [ OK ] pos_users       readable, 0 row(s) for this tenant/source
+```
+
+All seven agent tables. Gateway accepted the anon key, RLS accepted the token.
+
+### 1b. Authenticated write
+
+```
+    [ OK ] heartbeats     INSERT accepted, id=2, at=2026-08-10T01:54:23.784595+00:00
+    [ OK ] sync_state     UPDATE accepted (matched 0 row(s); lt.0 guard means it changes nothing)
+```
+
+The `sync_state` UPDATE went through the agent's real monotonic guard
+(`watermark_salid=lt.0`), so it matched nothing and changed nothing — which is the
+correct behaviour and also why it is safe to have run.
+
+### 1c. 🔴 Cleanup is impossible, and that is the design
+
+```
+    [ OK ] DELETE refused - the token holds INSERT/SELECT/UPDATE and no DELETE
+           DELETE heartbeats failed: HTTP 403 {"code":"42501", ...}
+```
+
+You asked me to clean up after the write. **I cannot, and neither can the agent.**
+`schema_v2_grants.sql` gives `authenticated` `select/insert/update` on the seven tables
+and deliberately no `DELETE`. That refusal is a property we want, so I did not look for a
+way around it.
+
+What is left behind, permanently:
+
+```
+    heartbeats id=2   ok=true   drift_seconds=null   rows_pulled=0
+    note kind: "pre_visit_token_test"
+```
+
+I chose `heartbeats` precisely because it is append-only telemetry — an extra row is
+noise, not state. Three consequences, all checked:
+
+- **It does not make the agent think it has already synced.** First-run is decided on
+  `sync_state.watermark_salid`, never on heartbeats. Proven below.
+- **It will not trip Phase C.** `--confirm` reads the *newest* heartbeat, and Phase B
+  runs a real cycle before Phase C, so the real one will be newer.
+- **It would trip `--confirm` if run standalone right now**, because its
+  `drift_seconds` is null and `--confirm` now refuses a heartbeat with no clock reading.
+  That is the check I added on your last note working as intended. It resolves the moment
+  a real cycle runs.
+
+### 1d. Tenant isolation
+
+```
+    [ OK ] refused, code 42501
+           POST heartbeats failed: HTTP 403 {"code":"42501", ... "message":"new row
+           violates row-level security policy ..."}
+```
+
+A foreign `tenant_id` is refused with **42501**. Same result as gate 3.
+
+### 1e. Least privilege
+
+```
+    [ OK ] events               denied, code 42501
+    [ OK ] outbox               denied, code 42501
+    [ OK ] tenants              denied, code 42501
+    [ OK ] internal_anomalies   denied, code 42501
+    [ OK ] sources              denied, code 42501
+    [ OK ] alert_settings       denied, code 42501
+    [ OK ] shift_reports        denied, code 42501
+```
+
+I added the last three beyond your list; same answer.
+
+### 1f. One result I will not claim as proof
+
+```
+    [ OK ] events INSERT denied, code PGRST204
+```
+
+`PGRST204` is *"column not found in schema cache"* — PostgREST rejected my payload shape
+**before** it reached the permission check. So that particular line proves nothing about
+privileges. The clean proof is 1e: `events` is denied `42501` at the table level, so no
+insert can reach it. I am flagging it rather than letting a green tick stand for
+something it did not test.
+
+**Check 1 verdict: the token reads, writes, is confined to its tenant, and is confined to
+its seven tables.** Signature-valid and gateway-accepted are now the same claim.
+
+---
+
+## Check 2 — the `sync_state` row
+
+Your query joins `sources` and `tenants`. The agent token is denied on both (42501,
+above), so I could not run it as written and did not try to route around it. This is what
+the token can see:
+
+```
+  rows visible to this token: 1
+    tenant_id              57b61b47-a590-49fe-803c-0c174a07b7ec
+    source_id              93f8d146-ba68-4d58-8eda-f797f3e28bd4
+    watermark_salid        0
+    watermark_saledeid     0
+    rescan_from_salid      0
+    pos_max_salid          None
+    last_sync_at           None
+    last_rescan_at         None
+    restore_suspected      False
+    schema_ok              True
+
+  exactly one row              YES
+  watermark_salid = 0          YES
+  restore_suspected = false    YES
+  schema_ok = true             YES
+
+  => MATCHES what you asked for
+```
+
+`last_sync_at` is null, which is consistent: nothing has ever synced. **Risk #3 is
+closed.**
+
+The one thing I have *not* verified is that this row's `tenant_id`/`source_id` map to
+`sobh_onthefast` and the right source — that needs the join, and the join needs
+`service_role`. The IDs match `config.json` exactly, which is what the agent checks. If
+you want the slug confirmed, it is one query from your side.
+
+And the reason it matters that this row exists:
+
+```
+  reconcile_with_cloud -> is_first_run = True
+  (decided on sync_state.watermark_salid, not on heartbeats)
+  heartbeats for this tenant/source now: 1
+```
+
+So the agent will correctly treat the shop as a first install, adopt `MAX(salid)`, and
+backfill nothing — with my stray heartbeat sitting there and changing none of it.
+
+---
+
+## Check 3 — does *this* config pass the agent's own validation
+
+### 3a. The real code path
+
+```
+  [ OK ] Config.load            accepted the file
+         required keys          all present
+         placeholder guard      passed (no <angle bracket> values)
+         assert_is_agent_token  passed - decoded, role and tenant_id checked
+
+         aud         authenticated
+         exp         1944006409
+         iat         1786326409
+         iss         supabase
+         role        authenticated
+         tenant_id   57b61b47-a590-49fe-803c-0c174a07b7ec
+         expires     2031-08-09T01:46:49+00:00
+
+  [ OK ] preflight sql block   complete, no placeholders
+```
+
+And the refusals still refuse, exercised against this file's own tenant:
+
+```
+  [ OK ] service_role refused: agent token has role='service_role', must be 'authenticated'
+  [ OK ] wrong tenant refused: agent token is for tenant 00000000-...-000000000000, but co...
+```
+
+`expires 2031-08-09` matches the `exp=2031-08-09` in your note, and `aud`, `iss`,
+`role` and `tenant_id` match line for line. Five years, as intended.
+
+### 3b. 🎯 Your suspicion was right: preflight never exercises the token here
+
+**Run A — real Supabase URL:**
+
+```
+  [ OK ] golden baseline: 31 passed
+
+  VERIFY.md step 3b — read-only proof (attempts to write, requires refusal)
+         attempting UPDATE, DELETE and INSERT against the POS database.
+
+  STOPPED at VERIFY.md step 3b — read-only proof
+    could not connect to the POS database: ('08001', '[08001] [Microsoft][ODBC SQL
+    Server Driver][DBNETLIB]SQL Server does not exist or access denied. (17) ...
+```
+
+**Run B — byte-identical config except `supabase_url` pointed at
+`https://this-host-does-not-exist-posentine.invalid`:**
+
+```
+  STOPPED at VERIFY.md step 3b — read-only proof
+    could not connect to the POS database: ('08001', '[08001] [Microsoft][ODBC SQL
+    Server Driver][DBNETLIB]SQL Server does not exist or access denied. (17) ...
+```
+
+**Identical stop with Supabase unreachable.** That is the proof rather than my reading of
+the source: nothing contacted Supabase before step 3b, so on this machine **check 1 above
+is the only place the token is proven.** You were right to ask.
+
+**What happens on site is different, and worth being precise about.** Once the POS
+connects, step 3b passes and step 4 runs `agent.py --dry-run`, which calls
+`reconcile_with_cloud` — a Supabase **read**. So the order at the shop is:
+
+| Step | Touches Supabase | What it proves |
+|---|---|---|
+| 3b | no | the POS refuses our writes |
+| 4 | **read** | the token authenticates and the gateway accepts it |
+| Phase B | **write** | the token can actually upload |
+| Phase C | read | the data landed |
+
+A token that reads but cannot write would pass step 4 and fail at Phase B — a clean stop,
+not a silent one. Check 1 has now removed that possibility in advance.
+
+### One thing that happened on the way, worth a line
+
+The first run of check 3b stopped before it started:
+
+```
+  STOPPED at VERIFY.md step 0 — code integrity
+    files in this clone have been edited: ['TO_CLAUDE_CODE.md']
+    What to do: git checkout -- .
+```
+
+That was your note, uncommitted. The git-based integrity check added yesterday bit on a
+real edit the first time it met one. It is live and it works.
+
+---
+
+## Summary
+
+| Check | Result |
+|---|---|
+| 1. Token reads / writes / isolated / least privilege | ✅ all four |
+| 2. `sync_state` row provisioned as required | ✅ exactly one, watermark 0 |
+| 3a. This config passes the agent's own validation | ✅ |
+| 3b. Does preflight exercise the token before stopping | ❌ **no** — proven, and check 1 is why that is now covered |
+
+**Nothing failed.** Two things for you to act on, neither of which I changed:
+
+- **Put `config.json` where the agent will look for it** — next to `agent.py` on the
+  till, not in `Docs/`. On this machine it is only in `Docs/`.
+- **Heartbeat `id=2` is permanent** and will be the newest until the first real cycle.
+  Expected, harmless, and named here so nobody wonders what it is when they read
+  `--confirm` output on site.
+
+Nothing else was touched. Working tree clean apart from this reply.
+
+---
+
 # 2026-08-10 01:00 UTC — SIGN-OFF. Last run green. Three answers.
 
 Everything below is raw output. Nothing is green that I had to explain.
