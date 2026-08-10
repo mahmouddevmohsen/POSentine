@@ -4,6 +4,209 @@ Newest section at the top.
 
 ---
 
+# 2026-08-10 16:50 UTC — three rulings executed, Release verified from the published asset
+
+**339 passed** (was 311 at the start of the day), `test_golden.py` exactly **31**, no
+locked file touched. Pushed: `origin/main` = **`23af648`**. Release **v1.0.0** is live and
+verified by downloading it.
+
+---
+
+## 1. INSERT probe — kept
+
+No change. Your reading is the one I'd have argued for: it returned 229 only because
+permission is checked before the identity rule, so it *worked when there was nothing to
+find* and would have gone INCONCLUSIVE in the exact case it exists to catch.
+
+## 2. Three states — implemented
+
+```
+VERIFIED      every file matches           -> proceed, silently
+TAMPERED      a file differs from tested   -> hard stop, no override
+NOT VERIFIED  nothing to compare against   -> loud warning + typed
+                                              acknowledgement
+```
+
+The rationale is in a comment **at the decision point** in `preflight.py`, in your words:
+tampered is positive evidence, unverified is absence of evidence, collapsing them is the
+category error the probe made — plus the asymmetry that explains why this warns and
+`PROBE_DEFECT` blocks, because `monitor_ro` and sqlguard sit *below* this check and do
+not depend on it. It ends: *"If a future session simplifies this into two states, it has
+reintroduced the bug in a different file."*
+
+The operator must type `UNVERIFIED`. A specific word, not a keypress — pressing enter is
+what someone does to make a screen go away, and this has to be a decision. Demonstrated:
+
+```
+--- wrong word typed => stops ---
+  To continue anyway, type UNVERIFIED and press enter.
+  STOPPED: the unverified-code warning was not acknowledged
+
+--- correct word => continues, on record ---
+  Acknowledged: UNVERIFIED. Continuing with unverified code.
+
+--- VERIFIED => no prompt at all ---
+  no prompt, proceeded
+```
+
+**The message names the exact download**, and names the button *not* to press:
+
+```
+  What to use instead:
+    posentine-<commit>.zip
+    from https://github.com/mahmouddevmohsen/POSentine/releases/latest
+    (the release asset, NOT 'Code -> Download ZIP')
+    or:  git clone https://github.com/mahmouddevmohsen/POSentine.git
+```
+
+It also states plainly that this is **not** a security hole — the POS still cannot be
+written to — and that what is lost is the ability to say *which* version is on the
+machine three weeks later. An operator who is told "warning" with no consequence learns
+to ignore warnings.
+
+**Non-interactive:** `--accept-unverified`. Still an explicit acknowledgement — someone
+typed a flag — rather than a default that lets it slide. With neither a person nor the
+flag it **stops**: a prompt nobody can answer must not answer itself.
+
+Eleven tests, including one that fails if the three-state rationale is ever removed from
+the source.
+
+## 3. Push + Release — done, and verified the way you specified
+
+Pushed `d7ede19`, `c98fd2c`, `23af648`. `origin/main` = `23af648`.
+
+**One thing I changed about how the asset was built.** My first build stamped
+`# built from: 23af648... +uncommitted changes` — my session log is tracked and was still
+being written. An asset stamped from a dirty tree is precisely the `ship/` mistake you
+named. So I **cloned the pushed commit into a clean directory and built there**:
+
+```
+23af648
+(empty = clean tree)
+  STAMP: # built from: 23af648ce8d668af611fb00fb7f9875aa734f9de
+```
+
+No `+uncommitted`. The bytes provably come from the commit, not from my working tree.
+
+### The gate: downloaded the PUBLISHED asset and checked it there
+
+```
+$ gh release download v1.0.0 --repo mahmouddevmohsen/POSentine
+  posentine-23af648ce8d6.zip
+
+=== the published folder ===
+  .git present : no
+  MANIFEST.txt : present
+  files        : 24
+
+=== INTEGRITY CHECK ON THE PUBLISHED ASSET ===
+
+  code integrity   OK — 25 files match MANIFEST.txt
+
+  => VERIFIED
+```
+
+And the other two states, on that same downloaded copy:
+
+```
+=== tamper the published copy ===
+  TAMPERED -> hard stop: files differ from the versions we verified: ['agent.py']
+  no acknowledgement offered: True
+
+=== restore ===
+  code integrity   OK — 25 files match MANIFEST.txt
+  VERIFIED -> proceeded with no prompt
+```
+
+The asset's sha256 matches the clean-clone build byte for byte
+(`3ccd68c4fc7d...`), so what GitHub is serving is what was built from the commit.
+
+**Option B is real.** Not "the manifest I built matches the tree I built it from" — a
+different machine's download, unpacked, checked, and tampered with.
+
+---
+
+## (a) Diagnostics bundles — ignored, confirmed
+
+```
+  diagnostics_20260810_055802/           IGNORED
+  readonly_proof.txt                     IGNORED
+  manifest_check.txt                     IGNORED
+  cloud.txt                              IGNORED
+  config.redacted.json                   IGNORED
+  versions.txt                           IGNORED
+  odbc.txt                               IGNORED
+  task.xml                               IGNORED
+  task_info.txt                          IGNORED
+  folder.txt                             IGNORED
+  README.txt                             IGNORED
+  install_logs/                          IGNORED
+
+  README.md                              tracked, correct
+```
+
+`README.txt` needed an anchored `/README.txt` — the bundle unpacks one at the root and an
+unanchored rule could hide a real file later. The repo's own readme is `README.md`, so
+there is no collision. `git add -A --dry-run` now stages only our own files.
+
+## (b) `_wrap` audit — **it could swallow an error number in a second place**
+
+One remaining call site, `readonly_probe.py:602`, and it was not benign:
+
+```python
+if answer.held is not False:
+    w(f"      {_wrap(answer.permitted_means, width - 10)}")
+```
+
+`permitted_means` carries **our prose** when a permission is held — but when the check
+**could not run**, `run_permission_checks` puts the server's error in that same field:
+
+```python
+except Exception as exc:
+    _, _, message = _error_parts(exc)
+    answers.append(PermissionAnswer(name, securable, permission, None,
+                                    f"could not ask: {message.strip()}"))
+```
+
+and `held is None` blocks the install. So the truncation removed the error number from
+**exactly the case that needs it** — the same information loss as the write probes, one
+section further down, in the other half of the report. Fixed by folding.
+**`_wrap` is deleted; nothing in that report truncates any more.**
+
+**Reported and not fixed, with reasons:**
+
+| Site | What it trims | Why I left it |
+|---|---|---|
+| `agent.py:839` | heartbeat note to 70 chars in `--confirm` | Screen summary only. The full note is in `cloud.txt` in the diagnostics zip (last 50 heartbeats, untrimmed). The identifier is lost from one line, not from the system. |
+| `agent.py:1081` | error detail to 500 chars, for the cloud | Deliberate and documented, and masked *before* truncating. The unfolded error is in `agent.log`. |
+| `audit_privileges.py:129` | response body to 200 chars | Cloud-side workflow, not the diagnostics path. |
+
+The rest are hashes, version tuples and menu slices.
+
+---
+
+## Where this leaves things
+
+- `origin/main` = `23af648`, tree clean.
+- **Release v1.0.0** published, asset `posentine-23af648ce8d6.zip`, verified by download.
+- **`VERIFY.md` needs one more edit I have not made**: it still tells the operator to use
+  "the release zip from GitHub Releases" without the version. Now that v1.0.0 exists I can
+  name it exactly. Say the word and I'll do it — I stopped because you asked for one
+  option implemented, not a sweep.
+- PyInstaller / generated config: **DEFERRED**, unevaluated, priors labelled as priors.
+- `monitor_ro.sql`: written, deliberately not applied, per your decision.
+
+Full session log, every command and every failure: `logs/session_20260810_160838.log`.
+
+## The count, since it is now six
+
+The `_wrap` finding is the sixth instance, and it is the first one found by **audit rather
+than by incident** — you asked where else it was used, and it was in the one other place
+where a server error reaches the screen. That is the cheapest one so far: no site visit,
+no bundle, one grep.
+
+---
+
 # 2026-08-10 16:40 UTC — probe fixed, ZIP integrity closed, one thing I did not do
 
 **329 passed** (was 311), `test_golden.py` exactly **31**, no locked file touched.

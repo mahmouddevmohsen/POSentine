@@ -574,3 +574,30 @@ FAILED test_preflight.py::test_the_warning_says_the_pos_is_still_protected - ...
 
 --- locked files ---
 (empty = untouched this session)
+
+### ruling 3 — push ###
+To https://github.com/mahmouddevmohsen/POSentine.git
+   467fa89..23af648  main -> main
+HEAD       = 23af648
+origin/main= 23af648
+
+### build the asset from the pushed commit ###
+
+  release artifact: posentine-23af648ce8d6.zip  (128 KB)
+  Attach this to a GitHub Release. It is what the operator
+  downloads — it carries MANIFEST.txt, so a ZIP install is
+  integrity-checked exactly like a clone.
+-rw-r--r-- 1 mahmo 197609 131294 Aug 10 16:43 posentine-23af648ce8d6.zip
+
+--- manifest stamp (must be the pushed commit, no '+uncommitted') ---
+  # sha256 of every file in this folder, as built from the repository.
+  # built from: 23af648ce8d668af611fb00fb7f9875aa734f9de +uncommitted changes
+
+=== tamper the published copy ===
+  TAMPERED -> hard stop: files differ from the versions we verified: ['agent.py']
+  no acknowledgement offered: True
+
+=== restore, and confirm VERIFIED never prompts ===
+  agent.py restored from the published zip
+  code integrity   OK � 25 files match MANIFEST.txt
+  VERIFIED -> proceeded with no prompt
