@@ -4,77 +4,80 @@
 
 ---
 
-# 2026-08-10 — final sign-off. Three answers, one last run.
+# 2026-08-10 — one last targeted check. Three unknowns, nothing else.
 
-## The closing gate
+This is **not** "run everything again". Everything else is signed off. There are
+exactly three things that have never been exercised, and all three are cheap to
+settle from where you are. He leaves for the shop after this.
 
-The import-closure test passing while `sqlguard` was missing is the fifth instance and
-the sharpest one yet — a test named *closed under import* that closed over one level.
-It would have shipped an agent with **no SQL write-guard at all**, and every check we
-have would have stayed green. You found it because I asked you to prove the test fires
-rather than trust that it would, and that is the only reason it was found.
-
-The fresh-clone finding is the same lesson from the other direction: the strongest
-check in the procedure was silently downgraded to `NOT VERIFIED` on the **exact path
-the operator takes**, and it only surfaced because you rehearsed the real path instead
-of the convenient one.
-
-`267011` on a fresh task, and `task_info.txt` rendering "no task" identically to "we
-didn't look" — both are the same family. Good.
+`config.json` is now in the project root (gitignored). It was assembled by me, not by
+`mint_agent_token.py`, so treat it as untrusted input and check it the way the agent
+will.
 
 ---
 
-## Answers to what you raised
+## 1. 🔴 The agent token in that file has never made a real request
 
-**1. `monitor_ro.sql` — do not apply it before this visit.**
+I minted it here from the JWT secret. I verified the signature by recomputing the HMAC
+over the anon key's own signing input and matching it byte for byte — so the secret is
+current and the algorithm is right. **But it has never touched Supabase.**
 
-You are right that the guarantee currently rests on a login with no committed
-definition, and right to flag it. But the login works, and `readonly_probe.py` proves
-its behaviour empirically at **every install** — which is a stronger statement than a
-file that says what we intended. Applying a permissions script to a working login the
-day before a site visit risks breaking the one thing we cannot debug remotely.
+Signature-valid and gateway-accepted are not the same claim. A wrong `aud`, an `exp`
+Supabase dislikes, a claim it ignores — none of that shows up in local verification.
 
-Keep the file. Apply it for customer #2, from the start, where it costs nothing.
+Prove it end to end, with the two-header pattern:
 
-**2. The clone carrying more than `ship/` — noted, not a blocker.**
+- An authenticated **read** succeeds
+- A **write** to one of the seven agent tables succeeds (then clean up)
+- The isolation property still holds: an insert with a **foreign `tenant_id`** is
+  refused with **42501**
+- The least-privilege property still holds: denied on `events` / `outbox` / `tenants` /
+  `internal_anomalies`
 
-I checked the correspondence for customer-sensitive content: `FROM_CLAUDE_CODE.md`,
-`TO_CLAUDE_CODE.md`, `README.md` and `READONLY_GUARANTEE.md` contain **zero**
-references to staff names, the cash findings, or the zero-invoice analysis. Nothing
-that lands on that till would embarrass us or expose the customer's people.
+Claims, for reference:
+```
+role=authenticated · tenant_id=57b61b47-a590-49fe-803c-0c174a07b7ec
+aud=authenticated · iss=supabase · exp=2031-08-09 · 279 chars
+```
 
-A Release zip built from `ship/` is the right answer and I want it — for customer #2,
-not for this visit. Do not change the delivery path now.
+If any of this fails, **stop and say so** — do not work around it. A token that reads
+but cannot write is worse than one that fails cleanly, because the install would look
+healthy and upload nothing.
 
-**3. Priority 4 stays open and unevaluated.** Correct call. Priors labelled as priors
-is the honest state. It is not on the critical path and it will not be until we have
-more than one customer.
+## 2. The `sync_state` row — your risk #3, still open
+
+You ranked it third and noted it is invisible from the till and ours to settle. Settle
+it now:
+
+```sql
+select t.slug, s.slug, ss.watermark_salid, ss.restore_suspected, ss.schema_ok
+from sync_state ss
+join sources s on s.id = ss.source_id
+join tenants t on t.id = ss.tenant_id;
+```
+
+Exactly one row, `watermark_salid = 0`, `restore_suspected = false`. If it is missing,
+provision it now — that is a one-line fix here and a wasted trip if it is discovered
+there.
+
+## 3. Does this specific `config.json` pass the agent's own validation
+
+Run it through the real path — `Config.load`, `assert_is_agent_token`, the placeholder
+check, the `service_role` refusal. Not a JSON parse: the actual code that runs on the
+till.
+
+Then `preflight.bat` against it. It will stop at the POS connection, which is the
+expected pass condition here. What I want to know is **whether it gets that far** and
+whether Supabase was exercised before it stopped — if the POS connection is attempted
+first, the token path may never run during preflight, and check 1 above is the only
+place it gets proven.
 
 ---
 
-## The last run
+## What I do not want
 
-One final full pass, then stop:
+No code changes. No refactors. No improvements. If one of these three fails, report it
+and we decide together — the last thing this needs the morning of a site visit is a
+fix nobody has slept on.
 
-- Full suite green, `test_golden.py` exactly **31**, no locked file changed beyond the
-  `sqlguard` wiring I applied.
-- `ship/` current against the guarded adapter, `MANIFEST.txt` regenerated, `sqlguard.py`
-  present.
-- Working tree clean, everything pushed, and tell me the **exact commit** the operator
-  will clone.
-- One more fresh-clone rehearsal **from the pushed commit** — not from a local copy —
-  to confirm what is on GitHub right now is what you rehearsed.
-
-Paste the raw output. If anything is not green, say so plainly rather than explaining
-it away.
-
-## Then answer these
-
-1. **Is there anything you need from me** before he stands in front of that machine?
-2. **Anything you would do differently** if this were being installed tomorrow rather
-   than today?
-3. **What is most likely to go wrong at the shop**, ranked — and for each, is the
-   failure loud, and does the transcript say enough for us to diagnose it from here?
-
-Question 3 is the one I care about. I would rather know the top three risks now than
-discover them by phone while he is standing at a counter.
+Paste the raw output for all three.
