@@ -599,7 +599,16 @@ def format_report(report: Report, width: int = 66) -> str:
             state = "HELD !!" if answer.held else "not held"
         w(f"    {state:<13} {answer.name}  ({answer.permission})")
         if answer.held is not False:
-            w(f"      {_wrap(answer.permitted_means, width - 10)}")
+            # Folded, not truncated. This line carries our own prose when the
+            # answer is HELD — but when the check could not RUN it carries the
+            # server's error verbatim ("could not ask: ..."), and `held is
+            # None` blocks the install. Truncating at 56 characters removed
+            # the error number from precisely the case that needs it: the
+            # identical information loss as the write probes, one section
+            # further down, found by auditing the call sites rather than
+            # waiting for it to cost a second visit.
+            for line in _fold(answer.permitted_means, width - 10):
+                w(f"      {line}")
     w("")
 
     w("  " + "-" * (width - 4))
@@ -664,13 +673,6 @@ def format_report(report: Report, width: int = 66) -> str:
         w("  Change nothing. Photograph this screen and call.")
     w("=" * width)
     return "\n".join(out)
-
-
-def _wrap(text: str, width: int) -> str:
-    """One line, trimmed. Kept for the ASKED section, where the text is our
-    own prose and losing the tail costs nothing."""
-    flat = " ".join(text.split())
-    return flat if len(flat) <= width else flat[:width - 3] + "..."
 
 
 def _fold(text: str, width: int) -> list[str]:

@@ -54,6 +54,20 @@ MIN_PYTHON = (3, 11)
 GOLDEN_TEST_COUNT = 31          # VERIFY.md step 3: "31 passed", not "0 failed"
 MANIFEST_NAME = "MANIFEST.txt"
 
+# The exact download, named. "Use a release" is a vague warning; this is an
+# instruction. The 2026-08-10 install ran from a repository ZIP
+# (`...\Downloads\POSentine-main`), which has neither a manifest nor a .git,
+# and the operator had nothing actionable on screen.
+RELEASES_URL = "https://github.com/mahmouddevmohsen/POSentine/releases/latest"
+RELEASE_ASSET = "posentine-<commit>.zip"
+
+NOT_VERIFIED = "code integrity   NOT VERIFIED — nothing here to check against"
+
+# What the operator must type to continue past NOT VERIFIED. A specific word,
+# not a keypress: pressing enter is what someone does to make a screen go
+# away, and this has to be a decision.
+ACKNOWLEDGEMENT = "UNVERIFIED"
+
 RULE = "─" * 66
 
 STEP_1 = "1 — console and Python"
@@ -253,21 +267,37 @@ def verify_manifest(root: Path) -> str:
         from_git = verify_with_git(root)
         if from_git:
             return from_git
+        # ── the third state ─────────────────────────────────────
+        # There are THREE outcomes here, not two, and collapsing any pair
+        # of them is a category error:
+        #
+        #   VERIFIED      every file matches. Proceed.
+        #   TAMPERED      a file differs from what we tested. Hard stop,
+        #                 no override — this raises Stop, above.
+        #   NOT VERIFIED  nothing to compare against. Neither of the above.
+        #
+        # Tampered is POSITIVE EVIDENCE of a problem. Unverified is ABSENCE
+        # OF EVIDENCE. Treating them the same is exactly the mistake the
+        # write probe made when it read "could not determine" as "denied" —
+        # and that one blocked a correct install at a customer site.
+        #
+        # So this is a loud warning plus a typed acknowledgement, never a
+        # hard stop and never a silent pass. The asymmetry with PROBE_DEFECT
+        # (which DOES block) is deliberate and worth stating: unverified
+        # code still cannot write to the POS, because `monitor_ro`'s
+        # permissions and the sqlguard choke point sit BELOW this check and
+        # do not depend on it. A probe defect, by contrast, means we cannot
+        # demonstrate that lower layer at all.
+        #
+        # If a future session "simplifies" this into two states, it has
+        # reintroduced the bug in a different file.
         # Reached on the customer machine on 2026-08-10: the folder was a
         # GitHub ZIP of the repository (`...\Downloads\POSentine-main`), so
         # there was no `.git` and no MANIFEST.txt, and the only wording the
         # operator saw was "NOT VERIFIED" with nothing to do about it.
         # Named explicitly now, because "we did not check" must never read
         # like a shrug.
-        return ("code integrity   NOT VERIFIED — this folder is neither a "
-                "release download\n"
-                "                   (no MANIFEST.txt) nor a git checkout "
-                "(no .git). A ZIP of the\n"
-                "                   repository is neither. Nothing here "
-                "confirms this machine is\n"
-                "                   running the code we tested. Use the "
-                "release zip from\n"
-                "                   GitHub Releases, or `git clone`.")
+        return NOT_VERIFIED
 
     try:
         entries = read_manifest(path)
@@ -745,8 +775,91 @@ class PhaseA:
         return FIRST_RUN_MARK in self.dry_run
 
 
+def require_acknowledgement(status: str, accept_unverified: bool = False,
+                            ask=input) -> None:
+    """Make the operator own the decision to run unverified code.
+
+    Only reached in the NOT VERIFIED state. TAMPERED has already raised, and
+    VERIFIED never gets here.
+
+    Non-interactive callers (our own tests, a rehearsal, CI) pass
+    `accept_unverified=True`. That is still an explicit acknowledgement —
+    someone typed a flag — rather than a default that lets it slide. With
+    neither a person nor the flag, this stops: a prompt nobody can answer
+    must not resolve itself.
+    """
+    if not status.startswith(NOT_VERIFIED):
+        return
+
+    print()
+    print("!" * 66)
+    print("  WARNING — this machine is running code we cannot identify")
+    print("!" * 66)
+    print()
+    print("  Nothing in this folder can be checked against what we tested:")
+    print("  there is no MANIFEST.txt (so it is not a release download) and")
+    print("  no .git (so it is not a clone). A ZIP of the repository, taken")
+    print("  from the green Code button, is neither.")
+    print()
+    print("  This is NOT the same as finding an altered file. An altered")
+    print("  file stops this install outright. This is the weaker case: we")
+    print("  have no evidence either way.")
+    print()
+    print("  It is not a security hole. The POS still cannot be written to:")
+    print("  that is enforced by the monitor_ro login and by the sqlguard")
+    print("  choke point, and neither of them depends on this check. What")
+    print("  you lose is the ability to say WHICH version of our code is on")
+    print("  this machine if something goes wrong three weeks from now.")
+    print()
+    print("  What to use instead:")
+    print(f"    {RELEASE_ASSET}")
+    print(f"    from {RELEASES_URL}")
+    print("    (the release asset, NOT 'Code -> Download ZIP')")
+    print("    or:  git clone https://github.com/mahmouddevmohsen/POSentine.git")
+    print()
+
+    if accept_unverified:
+        print(f"  --accept-unverified was passed. Continuing, on record.")
+        print("!" * 66)
+        return
+
+    # The tty guard applies only to the default asker. A caller that supplies
+    # its own `ask` has, by definition, someone to ask — and testing the
+    # acknowledgement path must not be impossible just because pytest gives
+    # us no terminal.
+    if ask is input and not sys.stdin.isatty():
+        raise Stop("0 — code integrity",
+                   "this folder cannot be verified, and there is nobody to "
+                   "ask",
+                   "Run this from a console so the warning can be "
+                   "acknowledged,\n"
+                   "    or pass --accept-unverified to state that you accept "
+                   "it.\n"
+                   "    Better: download the release asset named above and "
+                   "start again.")
+
+    print(f"  To continue anyway, type {ACKNOWLEDGEMENT} and press enter.")
+    print("  Anything else stops the install.")
+    print()
+    try:
+        typed = ask("  > ").strip().upper()
+    except (EOFError, KeyboardInterrupt):
+        typed = ""
+    if typed != ACKNOWLEDGEMENT:
+        raise Stop("0 — code integrity",
+                   "the unverified-code warning was not acknowledged",
+                   "Nothing was written. Download the release asset named "
+                   "above\n"
+                   "    and run this again — that path is checked file by "
+                   "file.")
+    print()
+    print(f"  Acknowledged: {ACKNOWLEDGEMENT}. Continuing with unverified code.")
+    print("!" * 66)
+
+
 def run_steps_0_to_4(config_name: str = "config.json",
-                     skip_install: bool = False) -> PhaseA:
+                     skip_install: bool = False,
+                     accept_unverified: bool = False) -> PhaseA:
     """Steps 0–4, in order, stopping at the first failure.
 
     One implementation, two callers: `preflight.main` for our own use and
@@ -754,6 +867,7 @@ def run_steps_0_to_4(config_name: str = "config.json",
     """
     integrity = verify_manifest(HERE)
     print(f"  {integrity}")
+    require_acknowledgement(integrity, accept_unverified)
 
     step_1_python()
     step_2_dependencies(skip_install)
@@ -770,6 +884,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="config file name, inside this folder")
     ap.add_argument("--skip-install", action="store_true",
                     help="do not run pip (offline machine, already installed)")
+    ap.add_argument("--accept-unverified", action="store_true",
+                    help="acknowledge, without a prompt, that this folder's "
+                         "code integrity cannot be checked. For our own "
+                         "non-interactive runs.")
     args = ap.parse_args(argv)
 
     configure_output()
@@ -784,7 +902,8 @@ def main(argv: list[str] | None = None) -> int:
 
     integrity = "code integrity   NOT VERIFIED — preflight stopped early"
     try:
-        integrity = run_steps_0_to_4(args.config, args.skip_install).integrity
+        integrity = run_steps_0_to_4(args.config, args.skip_install,
+                                     args.accept_unverified).integrity
     except Stop as stop:
         report_stop(stop)
         return 1

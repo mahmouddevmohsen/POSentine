@@ -49,3 +49,26 @@ desktop.ini
 # committing it would be a second copy of the code, which is the whole
 # thing ship/ exists to avoid.
 posentine-*.zip
+
+# ── Diagnostics collected FROM a customer machine — never commit ────
+# collect_diagnostics.bat produces these, and they are unpacked here to
+# read. They carry no password and no token, but they do carry the till's
+# Windows username, folder layout, installed packages and ODBC drivers.
+# Untracked was not enough: one `git add -A` publishes all of it.
+diagnostics_*/
+diagnostics_*.zip
+# The same files, when a bundle is unpacked into the repository root.
+readonly_proof.txt
+manifest_check.txt
+cloud.txt
+task.xml
+task_info.txt
+versions.txt
+odbc.txt
+folder.txt
+config.redacted.json
+install_logs/
+# Anchored to the root and named exactly: this is the bundle's own
+# README.txt. The repository's readme is README.md, so there is no
+# collision, and an unanchored `README.txt` could hide a real file later.
+/README.txt

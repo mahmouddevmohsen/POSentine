@@ -533,7 +533,8 @@ def report_success(phase_a: preflight.PhaseA, info: dict,
 def install(config_name: str = "config.json",
             skip_install: bool = False,
             skip_wait: bool = False,
-            transcript_path: Path | None = None) -> int:
+            transcript_path: Path | None = None,
+            accept_unverified: bool = False) -> int:
     started = _dt.datetime.now(_dt.timezone.utc)
     transcript_path = transcript_path or Path("(not recorded)")
 
@@ -549,7 +550,8 @@ def install(config_name: str = "config.json",
     # ---- Phase A -------------------------------------------------
     phase_header("A", "preflight — read-only, and the read-only proof",
                  "steps 1-4")
-    phase_a = preflight.run_steps_0_to_4(config_name, skip_install)
+    phase_a = preflight.run_steps_0_to_4(config_name, skip_install,
+                                         accept_unverified)
     banner("GATE A PASSED — nothing has been written anywhere yet")
     say("first install" if phase_a.is_first_install
         else "resuming an existing install")
@@ -602,6 +604,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--skip-install", action="store_true",
                     help="do not run pip (offline machine, already installed)")
+    ap.add_argument("--accept-unverified", action="store_true",
+                    help="acknowledge without a prompt that code integrity "
+                         "cannot be checked here")
     ap.add_argument("--skip-wait", action="store_true",
                     help="do not wait for Phase E. Leaves the install "
                          "UNVERIFIED; for our own rehearsals only.")
@@ -615,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         code = install(args.config, args.skip_install, args.skip_wait,
-                       transcript.path)
+                       transcript.path, args.accept_unverified)
         return code
     except preflight.Stop as stop:
         # Phase A speaks VERIFY.md's own language. Translated rather than

@@ -464,3 +464,113 @@ ship/ rebuilt
 ?? logs/
 .........................................                                [100%]
 329 passed in 6.14s
+
+### (b) every _wrap call site ###
+./readonly_probe.py:602:            w(f"      {_wrap(answer.permitted_means, width - 10)}")
+./readonly_probe.py:669:def _wrap(text: str, width: int) -> str:
+
+--- and every other truncation that could eat an identifier ---
+./agent.py:839:        note = (b.get("note") or "")[:70]
+./agent.py:925:                    len(result.unknown_itids), result.unknown_itids[:20])
+./agent.py:1081:        safe = logsetup.mask(detail)[:500]
+./audit_privileges.py:129:            f"{(resp.text or '')[:200]}"
+./collect_diagnostics.py:104:                digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+./fake_adapter.py:103:        for itid, _name, price in MENU[:3]:
+./fake_adapter.py:123:    for itid, _name, price in MENU[:5]:
+./logsetup.py:26:the cloud (`detail[:500]`) and by terminal wrapping, and a half-printed
+./make_ship.py:264:        print(f"  {digest[:12]}  {name}")
+./make_ship.py:315:    revision = git_revision().split()[0][:12]
+./preflight.py:236:    return f"code integrity   OK — clean checkout of commit {revision[:12]}"
+./preflight.py:303:    version = ".".join(str(n) for n in sys.version_info[:3])
+./readonly_probe.py:572:        # "[42000] [Microsoft][ODBC Driver 11 for SQL Server][SQ..." — the
+./readonly_probe.py:673:    return flat if len(flat) <= width else flat[:width - 3] + "..."
+./report.py:169:              for i, (n, q) in enumerate(m.top_items[:5])]
+./report.py:202:    L += [f"{medals[i]} {n} — {q:g}" for i, (n, q) in enumerate(items[:5])]
+
+--- what feeds permitted_means at readonly_probe.py:602 ---
+10-            value = None if row is None or row[0] is None else bool(row[0])
+11-        except Exception as exc:                       # noqa: BLE001
+12-            _, _, message = _error_parts(exc)
+13-            answers.append(PermissionAnswer(name, securable, permission, None,
+14:                                            f"could not ask: {message.strip()}"))
+15-            continue
+16-        answers.append(PermissionAnswer(name, securable, permission, value,
+
+--- and how it is printed ---
+        else:
+            state = "HELD !!" if answer.held else "not held"
+        w(f"    {state:<13} {answer.name}  ({answer.permission})")
+        if answer.held is not False:
+            w(f"      {_wrap(answer.permitted_means, width - 10)}")
+    w("")
+
+
+### (a) FINAL — git check-ignore on every bundle file ###
+  diagnostics_20260810_055802/           IGNORED
+  readonly_proof.txt                     IGNORED
+  manifest_check.txt                     IGNORED
+  cloud.txt                              IGNORED
+  config.redacted.json                   IGNORED
+  versions.txt                           IGNORED
+  odbc.txt                               IGNORED
+  task.xml                               IGNORED
+  task_info.txt                          IGNORED
+  folder.txt                             IGNORED
+  README.txt                             IGNORED
+  install_logs/                          IGNORED
+
+--- and README.md must still be tracked ---
+  README.md                              tracked, correct
+
+--- what would 'git add -A' stage now? ---
+add '.gitignore'
+add 'logs/session_20260810_160838.log'
+add 'readonly_probe.py'
+
+### ruling 2 — the three states, demonstrated ###
+
+--- 1. NOT VERIFIED, wrong word typed => stops ---
+  To continue anyway, type UNVERIFIED and press enter.
+  Anything else stops the install.
+
+  STOPPED: the unverified-code warning was not acknowledged
+
+--- 2. NOT VERIFIED, correct word typed => continues ---
+  Acknowledged: UNVERIFIED. Continuing with unverified code.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  CONTINUED, on record
+
+--- 3. VERIFIED => no prompt at all ---
+  no prompt, proceeded
+
+=========================== short test summary info ===========================
+FAILED test_preflight.py::test_not_verified_stops_unless_the_exact_word_is_typed
+FAILED test_preflight.py::test_not_verified_continues_when_acknowledged - pre...
+FAILED test_preflight.py::test_not_verified_is_never_a_silent_pass - prefligh...
+FAILED test_preflight.py::test_the_warning_names_the_exact_download - preflig...
+FAILED test_preflight.py::test_the_warning_says_the_pos_is_still_protected - ...
+5 failed, 63 passed in 2.63s
+E       AssertionError: assert ('SQL guard' in '\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n  WARNING � this machine is running code we can...ed: UNVERIFIED. Continuing with unverified code.\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n' or 'sqlguard' in '\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n  WARNING � this machine is running code we can...ed: UNVERIFIED. Continuing with unverified code.\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n')
+
+test_preflight.py:712: AssertionError
+=========================== short test summary info ===========================
+FAILED test_preflight.py::test_the_warning_says_the_pos_is_still_protected - ...
+1 failed, 67 passed in 2.58s
+
+### full suite ###
+=========================== short test summary info ===========================
+FAILED test_preflight.py::test_the_warning_says_the_pos_is_still_protected - ...
+1 failed, 338 passed in 6.38s
+
+### golden ###
+...............................                                          [100%]
+31 passed in 0.06s
+........................................................................ [ 84%]
+...................................................                      [100%]
+339 passed in 6.10s
+
+...............................                                          [100%]
+31 passed in 0.06s
+
+--- locked files ---
+(empty = untouched this session)

@@ -631,3 +631,106 @@ def test_the_release_artifact_does_not_carry_the_repository():
         assert "test_golden.py" in names, "the on-site baseline must still ship"
     finally:
         archive.unlink(missing_ok=True)
+
+
+# ════════════════════════════════════════════════════════════════
+# code integrity has THREE states, not two
+# ════════════════════════════════════════════════════════════════
+#
+#   VERIFIED      every file matches            -> proceed silently
+#   TAMPERED      a file differs from tested    -> hard stop, no override
+#   NOT VERIFIED  nothing to compare against    -> loud warning + typed
+#                                                  acknowledgement
+#
+# Tampered is positive evidence of a problem; unverified is absence of
+# evidence. Collapsing them is the same category error the write probe made
+# when it read "could not determine" as "denied" — and that one blocked a
+# correct install at a customer site.
+
+def test_verified_never_prompts():
+    def must_not_ask(_prompt):
+        raise AssertionError("a verified folder must not interrogate anyone")
+    P.require_acknowledgement("code integrity   OK — 25 files match MANIFEST.txt",
+                              ask=must_not_ask)
+
+
+def test_tampered_is_a_hard_stop_with_no_acknowledgement_offered(tmp_path):
+    """Positive evidence of a problem. There is no typing your way past it."""
+    shipped = tmp_path / "ship"
+    shipped.mkdir()
+    (shipped / "agent.py").write_bytes(b"# agent\n")
+    (shipped / "MANIFEST.txt").write_bytes(
+        (hashlib.sha256(b"# different\n").hexdigest() + "  agent.py\n").encode())
+
+    with pytest.raises(P.Stop) as caught:
+        P.verify_manifest(shipped)
+    assert "differ from the versions we verified" in caught.value.what
+    # and no acknowledgement path exists for it
+    assert P.ACKNOWLEDGEMENT not in caught.value.do
+
+
+def test_not_verified_stops_unless_the_exact_word_is_typed():
+    for typed in ("", "y", "yes", "ok", "UNVERIFIE", "continue"):
+        with pytest.raises(P.Stop) as caught:
+            P.require_acknowledgement(P.NOT_VERIFIED, ask=lambda _p, t=typed: t)
+        assert "not acknowledged" in caught.value.what
+
+
+def test_not_verified_continues_when_acknowledged():
+    P.require_acknowledgement(P.NOT_VERIFIED, ask=lambda _p: "unverified")
+    P.require_acknowledgement(P.NOT_VERIFIED, ask=lambda _p: "  UnVeRiFiEd  ")
+
+
+def test_not_verified_is_never_a_silent_pass(capsys):
+    """The state that produced the customer install: it printed one line and
+    carried on. It must now be impossible to miss."""
+    P.require_acknowledgement(P.NOT_VERIFIED, ask=lambda _p: "UNVERIFIED")
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "!!!!" in out, "the warning is not visually distinct"
+    assert "cannot identify" in out
+
+
+def test_the_warning_names_the_exact_download(capsys):
+    """A vague "use a release" is not an instruction. The operator needs the
+    asset name and the URL, and to be told which button NOT to press."""
+    P.require_acknowledgement(P.NOT_VERIFIED, ask=lambda _p: "UNVERIFIED")
+    out = capsys.readouterr().out
+    assert P.RELEASES_URL in out
+    assert "posentine-" in out
+    assert "Download ZIP" in out, "the wrong button must be named"
+    assert "git clone" in out
+
+
+def test_the_warning_says_the_pos_is_still_protected(capsys):
+    """Unverified code still cannot write to the POS: monitor_ro and the
+    sqlguard choke point sit BELOW this check and do not depend on it. That
+    asymmetry is exactly why this warns and PROBE_DEFECT blocks."""
+    P.require_acknowledgement(P.NOT_VERIFIED, ask=lambda _p: "UNVERIFIED")
+    out = capsys.readouterr().out
+    assert "monitor_ro" in out
+    assert "SQL guard" in out or "sqlguard" in out
+
+
+def test_a_prompt_nobody_can_answer_does_not_resolve_itself(monkeypatch):
+    """Non-interactive with no flag: stop. A question asked into a void must
+    not answer itself with 'yes'."""
+    monkeypatch.setattr(P.sys.stdin, "isatty", lambda: False, raising=False)
+    with pytest.raises(P.Stop) as caught:
+        P.require_acknowledgement(P.NOT_VERIFIED)
+    assert "nobody to ask" in caught.value.what
+
+
+def test_the_flag_is_itself_an_explicit_acknowledgement(monkeypatch, capsys):
+    monkeypatch.setattr(P.sys.stdin, "isatty", lambda: False, raising=False)
+    P.require_acknowledgement(P.NOT_VERIFIED, accept_unverified=True)
+    assert "--accept-unverified was passed" in capsys.readouterr().out
+
+
+def test_the_three_states_are_documented_where_they_are_decided():
+    """A future session that collapses this back to two states has
+    reintroduced the bug in a different file."""
+    source = (P.HERE / "preflight.py").read_text(encoding="utf-8")
+    assert "THREE outcomes" in source
+    assert "POSITIVE EVIDENCE" in source and "ABSENCE" in source
+    assert "sit BELOW this check" in source
