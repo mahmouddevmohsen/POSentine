@@ -601,3 +601,16 @@ origin/main= 23af648
   agent.py restored from the published zip
   code integrity   OK — 25 files match MANIFEST.txt
   VERIFIED -> proceeded with no prompt
+
+### FINAL STATE ###
+...................................................                      [100%]
+339 passed in 6.31s
+31 passed in 0.06s
+
+HEAD        = 5a49761
+origin/main = 5a49761
+ M logs/session_20260810_160838.log
+(clean)
+
+release:
+  v1.0.0  asset: posentine-23af648ce8d6.zip  (131279 bytes, 0 downloads)
