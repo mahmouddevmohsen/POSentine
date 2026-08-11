@@ -19,7 +19,7 @@ import os
 import events as E
 import supa
 
-DEDUP_KEY = "alert:audit_summary:2026-08-11"
+DEDUP_KEY = "audit_summary:2026-08-11"
 
 BODY = """\
 📋 تقرير تدقيق POSentine — 2026-08-11
@@ -71,7 +71,16 @@ def main() -> int:
         "tenant_id": tenant_id,
         "channel": "telegram",
         "recipient": r["address"],
-        "kind": "alert",
+        # NOT "alert": the notifier's gate_check() re-checks alert_settings.
+        # notify for kind=="alert" rows, keyed by a type parsed out of the
+        # dedup_key — that gate is for the six registered alert types
+        # (zero_invoice, refund, ...), not a one-off admin message, and
+        # correctly blocked this the first time it was tried with kind=
+        # "alert"/dedup "alert:audit_summary:...". A distinct kind skips
+        # that check entirely while still passing the recipient-level gates
+        # (active / go_live_at / notify_before_golive), which are the ones
+        # that actually matter here.
+        "kind": "audit_summary",
         "body": BODY,
         "dedup_key": DEDUP_KEY,
         "status": "pending",
