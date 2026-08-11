@@ -187,3 +187,90 @@ def test_zero_invoice_shift_with_real_cash_diff_still_reports_cash_diff():
     text = R.build_shift_report(m, _NO_COMPARISON, cash_event=cash_event)
     assert R.STATUS_CASH in text
     assert R.STATUS_NO_DATA not in text
+
+
+# ════════════════════════════════════════════════════════════════
+# daybook presentation — deduction direction must be explicit
+# ════════════════════════════════════════════════════════════════
+# The four daybook lines (مبيعات / مرتجع مبيعات / دليفري / مقبوضات) are
+# NOT all additive: the verified formula (metrics.py, pinned by
+# test_golden.py) is الإجمالي = مبيعات + مقبوضات − مرتجع − دليفري. The
+# 2026-08-11 presentation fix makes that direction visible in the text —
+# additive lines carry +, deduction lines carry −, and the formula is
+# spelled out under the total. These tests pin the presentation only;
+# the accounting formula is untouched and tested elsewhere.
+
+
+def _daybook_lines(text: str) -> dict[str, str]:
+    """Label -> rendered line, for the five daybook lines."""
+    out: dict[str, str] = {}
+    for ln in text.splitlines():
+        for label in ("مبيعات", "مرتجع مبيعات", "دليفري", "مقبوضات",
+                      "الإجمالي"):
+            if ln.startswith(label) and label not in out:
+                out[label] = ln
+    return out
+
+
+def test_daybook_returns_are_marked_as_deduction():
+    m = _shift(total_invoices=25, n_cash=20, n_return=3, n_external=2,
+               sales=1000.0, returns=250.0, delivery=0.0,
+               collections=300.0, grand_total=1050.0)
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    line = _daybook_lines(text)["مرتجع مبيعات"]
+    assert "−250" in line, line
+    assert "+250" not in line, line
+
+
+def test_daybook_delivery_is_marked_as_deduction():
+    m = _shift(total_invoices=25, n_cash=20, n_external=5,
+               sales=1000.0, returns=0.0, delivery=635.0,
+               collections=300.0, grand_total=665.0)
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    line = _daybook_lines(text)["دليفري"]
+    assert "−635" in line, line
+    assert "+635" not in line, line
+
+
+def test_daybook_sales_and_collections_are_additive():
+    m = _shift(total_invoices=25, n_cash=20, n_external=5,
+               sales=16305.0, returns=0.0, delivery=0.0,
+               collections=3365.0, grand_total=19670.0)
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    lines = _daybook_lines(text)
+    assert "+16,305" in lines["مبيعات"], lines["مبيعات"]
+    assert "+3,365" in lines["مقبوضات"], lines["مقبوضات"]
+
+
+def test_daybook_formula_clarification_is_present():
+    m = _shift(total_invoices=25, n_cash=20, n_external=5,
+               sales=16305.0, returns=250.0, delivery=635.0,
+               collections=3365.0, grand_total=18785.0)
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    assert "الإجمالي = مبيعات + مقبوضات − مرتجع مبيعات − دليفري" in text
+
+
+def test_daybook_total_value_is_unchanged():
+    # The presentation fix must not move the number: the customer's example
+    # report (16,305 + 3,365 − 250 − 635) keeps its verified total 18,785.
+    m = _shift(total_invoices=25, n_cash=20, n_external=5,
+               sales=16305.0, returns=250.0, delivery=635.0,
+               collections=3365.0, grand_total=18785.0)
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    line = _daybook_lines(text)["الإجمالي"]
+    assert "18,785" in line, line
+    assert "20,555" not in text, text   # the naive sum must never appear
+
+
+def test_daybook_zeros_render_with_signs():
+    # Zero-value deduction lines still show their direction: a bare "0"
+    # under the old layout read as an additive zero; −0 says "nothing
+    # deducted" instead.
+    m = _shift(total_invoices=25, n_cash=25, sales=0.0,
+               returns=0.0, delivery=0.0, collections=0.0, grand_total=0.0)
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    lines = _daybook_lines(text)
+    assert "−0" in lines["مرتجع مبيعات"], lines["مرتجع مبيعات"]
+    assert "−0" in lines["دليفري"], lines["دليفري"]
+    assert "+0" in lines["مبيعات"], lines["مبيعات"]
+    assert "+0" in lines["مقبوضات"], lines["مقبوضات"]
