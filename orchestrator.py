@@ -396,10 +396,30 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
         prev_total, prev_count = pw.grand_total, pw.total_invoices
     comparison = M.compare_to_last_week(m.grand_total, prev_total, prev_count)
 
-    # is_partial: the shift that was in progress when the agent first synced.
-    # Recorded and never reported (schema.sql comment).
-    is_partial = (state.first_sync_at is not None
-                  and start <= state.first_sync_at.astimezone(tz).replace(tzinfo=None) < end)
+    # is_partial: this shift's window has no reliable full-shift coverage from
+    # the agent, so it is recorded (to satisfy existing_reports and stop the
+    # lookback scan from retrying it forever) but never reported.
+    #
+    # Two cases, both real:
+    #   1. straddle  — the agent's first sync landed inside this window, so
+    #      only the tail of the shift was observed.
+    #   2. no_coverage — the whole window closed at or before the agent's
+    #      first sync. There is no backfill (agent.py adopts MAX(salid) on
+    #      first run and reads nothing behind it — installer.py, VERIFY.md
+    #      step 4a), so a shift that ended before first_sync_at is
+    #      GUARANTEED to have zero real invoices, not a genuinely quiet shift.
+    #      Without this, MAX_SHIFT_LOOKBACK_DAYS walks backward through every
+    #      pre-install shift and reports each one "🟢 الوردية مستقرة" — a
+    #      confirmed false green, reproduced live against production
+    #      Supabase on 2026-08-11 (shift_report:2026-08-07/08:*, all-zero,
+    #      sent to the dev chat).
+    if state.first_sync_at is not None:
+        first_sync_local = state.first_sync_at.astimezone(tz).replace(tzinfo=None)
+        straddle = start <= first_sync_local < end
+        no_coverage = end <= first_sync_local
+        is_partial = straddle or no_coverage
+    else:
+        is_partial = False
 
     cash_diffs = sorted((e for e in cash_events if e.type == "cash_diff"
                          and start <= e.occurred_at < end),

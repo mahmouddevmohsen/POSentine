@@ -235,6 +235,79 @@ def test_partial_first_shift_is_recorded_but_never_reported():
     assert not any(e.kind == "shift_report" for e in out.envelopes)
 
 
+def test_shift_entirely_before_install_is_never_reported():
+    """
+    Regression for the live false-green: agent.py adopts MAX(salid) on first
+    run and reads nothing behind it (no backfill by design — installer.py,
+    VERIFY.md step 4a), so a shift whose window closed before first_sync_at
+    is GUARANTEED to have zero real invoices. Reproduced live against
+    production Supabase on 2026-08-11: shift_report:2026-08-07:evening and
+    2026-08-08:morning/evening were built with grand_total=0, is_partial was
+    False, and all three were enqueued and actually sent to the dev chat.
+    This shift's window (2026-06-29 evening) ends at 2026-06-30 07:00, a
+    full day before first_sync_at — no straddle, so the OLD is_partial
+    condition (`start <= first_sync_at < end`) missed it entirely.
+    """
+    s = state(invoices=[],  # no backfill: genuinely nothing here, ever
+              first_sync=_dt.datetime(2026, 7, 1, 4, 0,
+                                      tzinfo=_dt.timezone.utc))  # 07:00 Cairo, Jul 1
+    out = orchestrator.plan(utc(2026, 7, 2, 4, 10), ctx(), s,
+                            force_shift="evening",
+                            shift_date=_dt.date(2026, 6, 29))
+    assert out.shift_row is not None
+    assert out.shift_row["is_partial"] is True
+    assert out.shift_row["grand_total"] == 0.0
+    assert not any(e.kind == "shift_report" for e in out.envelopes)
+
+
+def test_shift_boundary_ending_exactly_at_first_sync_has_no_coverage():
+    """end == first_sync_at: the agent's very first sync happened the
+    instant this shift closed — zero overlap, not a straddle."""
+    first_sync_local = t(2026, 6, 30, 19, 0)          # exactly shift end
+    s = state(invoices=[],
+              first_sync=first_sync_local.replace(tzinfo=_dt.timezone.utc))
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s,
+                            force_shift="morning",
+                            shift_date=_dt.date(2026, 6, 30))
+    assert out.shift_row["is_partial"] is True
+    assert not any(e.kind == "shift_report" for e in out.envelopes)
+
+
+def test_multi_shift_backfill_never_leaks_a_stable_report():
+    """
+    The exact live scenario: a fresh install with no existing_reports and
+    MAX_SHIFT_LOOKBACK_DAYS=14 walking backward. Seed several closed shifts
+    entirely before first_sync_at (no invoices — no backfill) plus one real
+    post-install shift, and drive plan() repeatedly the way the cron does
+    (one shift decided per call, each recorded before the next call). None
+    of the pre-install shifts may ever produce a "shift_report" envelope,
+    and none of their bodies (if ever built) may contain STATUS_STABLE.
+    """
+    first_sync = _dt.datetime(2026, 7, 10, 14, 0, tzinfo=_dt.timezone.utc)  # 17:00 Cairo Jul 10
+    real_shift_invs = [inv(i, t(2026, 7, 10, 20, 0)) for i in range(1, 25)]
+    now = utc(2026, 7, 11, 8, 0)
+
+    existing: set[tuple[_dt.date, str]] = set()
+    reported_stable_pre_install = []
+    for _ in range(6):                     # walk back through several shifts
+        s = state(existing=existing, invoices=real_shift_invs, first_sync=first_sync)
+        out = orchestrator.plan(now, ctx(), s)
+        if out.shift_row is None:
+            break
+        key = (_dt.date.fromisoformat(out.shift_row["shift_date"]),
+               out.shift_row["shift_name"])
+        existing.add(key)
+        for e in out.envelopes:
+            if e.kind == "shift_report" and R.STATUS_STABLE in e.body:
+                reported_stable_pre_install.append((key, out.shift_row))
+
+    # every shift with zero real coverage must never have been announced stable
+    for key, row in reported_stable_pre_install:
+        assert row["grand_total"] != 0.0 or row["is_partial"], (
+            f"false green: {key} reported STATUS_STABLE with grand_total="
+            f"{row['grand_total']} is_partial={row['is_partial']}")
+
+
 # ════════════════════════════════════════════════════════════════
 # monthly — decision 4
 # ════════════════════════════════════════════════════════════════

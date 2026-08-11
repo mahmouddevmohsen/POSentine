@@ -296,7 +296,7 @@
           n_cash         integer,
           n_return       integer,
           n_external     integer,
-          is_partial     boolean not null default false,   -- أول وردية بعد التركيب
+          is_partial     boolean not null default false,   -- بدون تغطية كاملة (تركيب جوه الوردية أو الوردية كلها قبل التركيب)
           generated_at   timestamptz not null default now(),
           primary key (tenant_id, source_id, shift_date, shift_name)
         );
@@ -304,7 +304,9 @@
         comment on column shift_reports.grand_total is
           'يومية الخزينة: sales + collections − returns − delivery  (متحقق: 19,205)';
         comment on column shift_reports.is_partial is
-          'الوردية الجارية وقت التركيب — تتسجل ومايتبعتش عنها تقرير';
+          'مفيش تغطية كاملة للوردية دي — إما التركيب حصل جواها، أو خلصت قبل ما '
+          'الإيجنت يشتغل خالص (مفيش backfill). بتتسجل عشان توقف إعادة المحاولة، '
+          'ومايتبعتش عنها تقرير للمالك';
 
         -- أي حاجة غير متوقعة نشوفها إحنا بس
         create table if not exists internal_anomalies (

@@ -52,11 +52,20 @@ def _hm(t: _dt.datetime) -> str:
 STATUS_STABLE = "🟢 الوردية مستقرة"
 STATUS_REVIEW = "🟡 الوردية تحتاج مراجعة"
 STATUS_CASH = "🔴 يوجد فرق يستحق المراجعة"
+STATUS_NO_DATA = "⚪ لا توجد بيانات كافية لهذه الوردية"
 
 
-def pick_status(has_cash_diff: bool, has_notes: bool) -> str:
+def pick_status(has_cash_diff: bool, has_notes: bool, has_data: bool = True) -> str:
+    """
+    ⚠️ has_data=False (صفر فواتير في نافذة الوردية) لازم يسبق "مستقرة" —
+       صفر فواتير معناه إننا مراقبناش الوردية دي، مش إنها كانت هادئة فعلاً.
+       الفرق في الخزينة (لو موجود) بييجي من جدول تاني (cash_counts) ومستقل
+       عن الفواتير، فبيفضل الأولوية الأعلى حتى لو مفيش فواتير.
+    """
     if has_cash_diff:
         return STATUS_CASH
+    if not has_data:
+        return STATUS_NO_DATA
     if has_notes:
         return STATUS_REVIEW
     return STATUS_STABLE
@@ -81,13 +90,18 @@ _SUMMARIES = {
         "المبيعات طبيعية، لكن توجد عمليات تحتاج مراجعة."),
     ("cash", "*"): ("⚠️ الخلاصة",
         "المبيعات طبيعية، لكن يوجد فرق في الخزينة وبعض العمليات تحتاج مراجعة."),
+    ("no_data", "*"): ("⚪ الخلاصة",
+        "لا توجد فواتير مسجّلة لهذه الوردية — لا يمكن تقييمها. "
+        "الأرقام أعلاه ليست نتيجة تحقّق، لأن مفيش بيانات نبني عليها الحكم."),
 }
 
 
 def pick_summary(has_cash_diff: bool, has_notes: bool,
-                 direction: str) -> tuple[str, str]:
+                 direction: str, has_data: bool = True) -> tuple[str, str]:
     if has_cash_diff:
         return _SUMMARIES[("cash", "*")]
+    if not has_data:
+        return _SUMMARIES[("no_data", "*")]
     if has_notes:
         return _SUMMARIES[("notes", "*")]
     return _SUMMARIES[("stable", direction if direction in
@@ -128,6 +142,9 @@ def build_shift_report(
     """بيرجّع نص جاهز للإرسال. مبيحسبش أي رقم — كله جاي من metrics."""
     has_cash = cash_event is not None
     has_notes = bool(notes)
+    # صفر فواتير في نافذة الوردية = مراقبناش الوردية دي (وردية قبل التركيب،
+    # عطل، انقطاع اتصال...) — مش دليل إنها كانت هادئة فعلاً. ممنوع "مستقرة".
+    has_data = m.total_invoices > 0
 
     user = m.primary_user.name if m.primary_user else "غير محدد"
     L: list[str] = [
@@ -136,7 +153,7 @@ def build_shift_report(
         f"🕐 {M.shift_label_ar(m.shift_name)} — {user} · "
         f"{_hm(m.window_start)} ← {_hm(m.window_end)}",
         "",
-        pick_status(has_cash, has_notes),
+        pick_status(has_cash, has_notes, has_data),
         "",
         f"مبيعات          {M.money(m.sales)} ج",
         f"مرتجع مبيعات    {M.money(m.returns)} ج",
@@ -181,7 +198,7 @@ def build_shift_report(
             shown.append(f"و {extra} غيرها")
         L += ["", "⚠️ ملاحظات تحتاج مراجعة"] + [f"• {n}" for n in shown]
 
-    title, body = pick_summary(has_cash, has_notes, comparison.direction)
+    title, body = pick_summary(has_cash, has_notes, comparison.direction, has_data)
     L += ["", title, body]
 
     text = "\n".join(L)
