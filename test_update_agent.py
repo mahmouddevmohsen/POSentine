@@ -48,6 +48,7 @@ everywhere.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -182,6 +183,53 @@ def test_bat_stays_thin_and_calls_the_updater():
 
 def test_bat_never_uses_git():
     assert "git" not in BAT.read_text(encoding="utf-8-sig").lower()
+
+
+requires_cmd = pytest.mark.skipif(
+    os.name != "nt",
+    reason="needs cmd.exe - the bat precheck runs under Windows cmd",
+)
+
+
+@requires_cmd
+def test_bat_stops_cleanly_when_the_updater_is_not_next_to_it(tmp_path):
+    """The exact failure shape from the till: a loose copy of the bat in
+    a folder with no install\\ next to it (the customer's scenario). It
+    must stop with a clear message and exit 1, and must never reach the
+    PowerShell invocation."""
+    work = tmp_path / "stray"
+    work.mkdir()
+    shutil.copy2(BAT, work / "UPDATE_POSENTINE.bat")
+    result = subprocess.run(
+        ["cmd", "/c", "UPDATE_POSENTINE.bat"],
+        cwd=str(work), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        stdin=subprocess.DEVNULL, timeout=60)
+    assert result.returncode == 1, result.stdout
+    assert "update_agent.ps1 was not found next to this file" in result.stdout
+    assert "Nothing was run and nothing was changed" in result.stdout
+    assert "powershell" not in result.stdout.lower()
+
+
+@requires_cmd
+def test_bat_stops_cleanly_in_the_extracted_delivery_folder(tmp_path):
+    """A bat double-clicked inside the freshly extracted delivery folder
+    (install\\update_agent.ps1 present, config.json absent - config.json
+    is never in a release zip) is the delivery-folder trap. The bat must
+    name it before PowerShell ever runs."""
+    work = tmp_path / "extracted"
+    (work / "install").mkdir(parents=True)
+    shutil.copy2(BAT, work / "UPDATE_POSENTINE.bat")
+    shutil.copy2(UPDATER, work / "install" / "update_agent.ps1")
+    result = subprocess.run(
+        ["cmd", "/c", "UPDATE_POSENTINE.bat"],
+        cwd=str(work), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        stdin=subprocess.DEVNULL, timeout=60)
+    assert result.returncode == 1, result.stdout
+    assert "extracted delivery folder" in result.stdout
+    assert "Nothing was run and nothing was changed" in result.stdout
+    assert "powershell" not in result.stdout.lower()
 
 
 def test_ps1_never_runs_git():

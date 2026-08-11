@@ -85,6 +85,19 @@ SHIPPED: tuple[tuple[str, str], ...] = (
     ("install/install_agent.ps1", "registers the task; -ShowXml to inspect first"),
     ("install/uninstall_agent.ps1", "removes the task; leaves data untouched"),
     ("install/run_agent.ps1", "what the task executes; the task's environment block"),
+
+    # ── the one-click till updater (Session 10, d9e27b6) ─────────
+    # These make the updater self-propagate: every future release zip
+    # carries the updater itself, so the operator never has to chase a
+    # stray copy of the .bat again. Before they were added, the zip had
+    # no update_agent.ps1 anywhere — the updater could not exist on the
+    # till except by hand-copy, which is exactly how a wrong placement
+    # happened. The .bat resolves install\update_agent.ps1 relative to
+    # its own location, and its precheck says so out loud instead of
+    # letting PowerShell report a cryptic missing-file error.
+    ("UPDATE_POSENTINE.bat", "double-click: the fail-closed one-click updater entry point"),
+    ("UPDATE_README.txt", "the operator's instructions for the one-click update"),
+    ("install/update_agent.ps1", "the updater: precheck/backup/stop/update/preflight/start/monitor/confirm"),
 )
 
 # Deliberately absent, and named so their absence is a decision rather than
