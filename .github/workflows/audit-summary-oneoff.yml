@@ -1,0 +1,49 @@
+# POSentine — ONE-OFF: enqueue the 2026-08-11 forensic audit summary
+#
+# Manual dispatch only, no schedule. Runs send_audit_summary_oneoff.py, which
+# issues exactly one insert_ignore against `outbox` (idempotent, unique
+# dedup_key, cannot duplicate-send) — no update/delete anywhere, no direct
+# Telegram call, no POS connection. The actual send happens through the real
+# delivery path on the next `delivery.yml` run (cron or manual dispatch),
+# exactly like any other outbox row. Meant to be deleted once confirmed sent.
+
+name: POSentine audit summary (one-off)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  enqueue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-cloud.txt
+
+      - name: Install cloud dependencies
+        run: pip install -r requirements-cloud.txt
+
+      - name: Structural guard — only insert_ignore into outbox, nothing else
+        run: |
+          set -euo pipefail
+          if grep -nE '\.upsert\(|\.update\(|\.delete\(' send_audit_summary_oneoff.py; then
+            echo "::error::send_audit_summary_oneoff.py must only insert_ignore — found an update/delete/upsert call"
+            exit 1
+          fi
+          echo "audit-summary script confirmed insert_ignore-only"
+
+      - name: Enqueue the audit summary onto outbox
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: python send_audit_summary_oneoff.py
