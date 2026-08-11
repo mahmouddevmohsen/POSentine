@@ -53,6 +53,13 @@ def _eq_clause(row: dict, clause: str) -> bool:
         return str(row.get(key)) == val
     if op == "is":
         return row.get(key) is None
+    if op == "lt":
+        # Same lexicographic-string assumption as the top-level `lt.`
+        # branch in _match: safe only for timespec='seconds' ISO-8601 UTC
+        # strings. A NULL value is not "less than" anything (matches
+        # SQL's NULL < x = UNKNOWN semantics) — never matches here.
+        v = row.get(key)
+        return v is not None and str(v) < val
     return False
 
 
@@ -640,6 +647,21 @@ def test_stuck_sending_dry_run_counts_without_writing():
     assert client.anomalies == []
     writes = [c for c in client.calls if c[0] in ("insert", "update")]
     assert writes == []
+
+
+def test_stuck_sending_catches_a_null_claimed_at_row():
+    """A row already 'sending' at the instant schema_v5 is applied gets
+    claimed_at=NULL forever (the migration has no backfill). A plain
+    `claimed_at=lt.cutoff` filter would never match NULL (SQL's
+    NULL < x is UNKNOWN, not true) — silently defeating H4's whole
+    purpose for exactly the rows most likely to be genuinely orphaned.
+    NULL age is unknown, not zero: treated as already-stuck."""
+    now = utc(2026, 7, 1, 4, 10)
+    tbl = tables(outbox=[obox(1, status="sending", claimed_at=None)])
+    summary, session, client = deliver(tbl, now=now)
+    assert summary.stuck_sending == 1
+    assert len(client.anomalies) == 1
+    assert json.loads(client.anomalies[0]["detail"])["outbox_id"] == 1
 
 
 # ════════════════════════════════════════════════════════════════

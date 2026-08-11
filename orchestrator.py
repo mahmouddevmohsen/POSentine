@@ -316,10 +316,18 @@ def _aged_out_gaps(
     anomaly each, so the gap surfaces loudly instead of aging out.
 
     Deliberately skipped: shifts whose window closed at or before
-    first_sync_local. Pre-install history is intentionally unsupported
-    (agent.py adopts MAX(salid) on first run and reads nothing behind it
-    — no backfill by design) and those shifts are recorded is_partial
-    by the normal lookback walk, so their absence is expected, not a gap.
+    first_sync_local (no_coverage), AND shifts whose window straddles it
+    (start <= first_sync_local < end) — the exact same two cases
+    _build_shift_report treats as is_partial/never-reported (see its
+    no_coverage/straddle computation). Both are pre-install history,
+    intentionally unsupported (agent.py adopts MAX(salid) on first run and
+    reads nothing behind it — no backfill by design); the straddle shift
+    in particular is recorded (is_partial=True) as soon as select_shift
+    reaches it, but under a long enough startup backlog it could still age
+    past the lookback before that happens — exempting it here the same
+    way _build_shift_report already does keeps this pass from raising a
+    shift_gap_aged_out anomaly for a shift that was never meant to be
+    independently reportable.
     """
     today = local_now.date()
     out: list[tuple[_dt.date, str, _dt.datetime]] = []
@@ -332,8 +340,14 @@ def _aged_out_gaps(
                 continue                        # not closed yet
             if (d, name) in existing:
                 continue                        # already reported/recorded
-            if first_sync_local is not None and closes <= first_sync_local:
-                continue                        # pre-install: intentional
+            if first_sync_local is not None:
+                starts = (_dt.datetime.combine(d, ctx.shift_morning_start)
+                         if name == M.MORNING else
+                         _dt.datetime.combine(d, ctx.shift_evening_start))
+                no_coverage = closes <= first_sync_local
+                straddle = starts <= first_sync_local < closes
+                if no_coverage or straddle:
+                    continue                    # pre-install: intentional
             out.append((d, name, closes))
     out.sort(key=lambda c: c[2])
     return out

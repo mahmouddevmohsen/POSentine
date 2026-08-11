@@ -626,6 +626,29 @@ def test_pre_install_shifts_are_never_aged_out_gaps():
         assert closes > first_sync_local, "pre-install shift flagged as a gap"
 
 
+def test_straddle_shift_is_never_an_aged_out_gap():
+    """_build_shift_report treats a shift whose window straddles
+    first_sync_local (start <= first_sync_local < end) as is_partial —
+    recorded, never reported — the same case _aged_out_gaps must also
+    exempt. The no_coverage-only check this used to be (closes <=
+    first_sync_local) does not catch a straddle, since its close is
+    always after first_sync_local by construction; a long enough startup
+    backlog could let exactly this one shift age past the 14-day lookback
+    and raise a shift_gap_aged_out anomaly for a shift that was never
+    meant to be independently reportable."""
+    local_now = t(2026, 7, 31, 7, 10)
+    first_sync_local = t(2026, 7, 11, 12, 0)   # mid-morning-shift install
+    gaps = orchestrator._aged_out_gaps(local_now, ctx(), set(), 14, 60,
+                                       first_sync_local=first_sync_local)
+    gap_dates = {(d, n) for d, n, _ in gaps}
+    # the straddled morning shift (07:00-19:00, install at 12:00) must
+    # never be flagged...
+    assert (_dt.date(2026, 7, 11), "morning") not in gap_dates
+    # ...but the immediately-following, fully-post-install evening shift
+    # still is — the exemption must not over-reach into real gaps
+    assert (_dt.date(2026, 7, 11), "evening") in gap_dates
+
+
 def test_aged_gap_never_claims_a_shift_still_in_the_lookback():
     """With NOTHING reported, every shift in the last 14 days belongs to
     select_shift (it will be walked and recorded, is_partial or not). The

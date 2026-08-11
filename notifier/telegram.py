@@ -442,10 +442,19 @@ def scan_stuck_sending(
     if not supported:
         return []
     cutoff = (now_utc - _dt.timedelta(minutes=threshold_minutes))
+    # A plain `claimed_at=lt.<cutoff>` filter would silently exclude any
+    # row with claimed_at IS NULL forever: SQL's `NULL < x` is UNKNOWN, not
+    # true, so WHERE drops it. That column is added by schema_v5 with no
+    # backfill, so every row already in 'sending' at the instant the owner
+    # applies the migration gets exactly that NULL — and would otherwise
+    # never be caught by this scan again, defeating the whole point of H4.
+    # An `is.null` row's age is unknown, not zero, so it's treated as
+    # already-stuck rather than silently skipped.
     stuck = client.select("outbox", {
         "tenant_id": f"eq.{ctx.tenant_id}",
         "status": "eq.sending",
-        "claimed_at": f"lt.{cutoff.isoformat(timespec='seconds')}",
+        "or": f"(claimed_at.lt.{cutoff.isoformat(timespec='seconds')},"
+              f"claimed_at.is.null)",
         "select": "id,recipient,dedup_key,claimed_at",
         "order": "claimed_at.asc"})
     if not stuck:
