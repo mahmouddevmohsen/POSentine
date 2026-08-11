@@ -78,6 +78,63 @@ def test_pick_status_cash_diff_still_wins_when_no_invoice_data():
     assert R.pick_status(True, False, has_data=False) == R.STATUS_CASH
 
 
+# ════════════════════════════════════════════════════════════════
+# H3 — coverage-gap status: cash > no_data > gap > notes > stable
+# ════════════════════════════════════════════════════════════════
+
+def test_pick_status_incomplete_when_coverage_gap():
+    assert R.pick_status(False, False, True, has_coverage_gap=True) \
+        == R.STATUS_INCOMPLETE
+
+
+def test_pick_status_incomplete_beats_notes():
+    # a coverage gap is a stronger claim than "a few operations to review"
+    assert R.pick_status(False, True, True, has_coverage_gap=True) \
+        == R.STATUS_INCOMPLETE
+
+
+def test_pick_status_cash_diff_beats_incomplete():
+    # cash reconciliation is an independent physical signal — it must never
+    # be masked by a coverage gap (or anything else)
+    assert R.pick_status(True, False, True, has_coverage_gap=True) \
+        == R.STATUS_CASH
+
+
+def test_pick_status_no_data_beats_incomplete():
+    # a shift with zero invoices was not watched at all — a stronger claim
+    # than a partially-watched one
+    assert R.pick_status(False, False, False, has_coverage_gap=True) \
+        == R.STATUS_NO_DATA
+
+
+def test_pick_status_stable_without_gap():
+    assert R.pick_status(False, False, True, has_coverage_gap=False) \
+        == R.STATUS_STABLE
+
+
+def test_pick_summary_incomplete_has_its_own_text():
+    title, body = R.pick_summary(False, False, "none", True,
+                                 has_coverage_gap=True)
+    assert title == "🟠 الخلاصة"
+    assert "انقطاع" in body
+    assert "مستقرة" not in body
+
+
+def test_build_shift_report_with_gap_says_incomplete():
+    m = _shift(total_invoices=25, n_cash=25, sales=1000.0,
+               collections=0.0, returns=0.0, delivery=0.0, grand_total=1000.0)
+    text = R.build_shift_report(m, _NO_COMPARISON, has_coverage_gap=True)
+    assert R.STATUS_INCOMPLETE in text
+    assert R.STATUS_STABLE not in text
+
+
+def test_build_shift_report_without_gap_stays_stable():
+    m = _shift(total_invoices=25, n_cash=25, sales=1000.0, grand_total=1000.0)
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    assert R.STATUS_STABLE in text
+    assert R.STATUS_INCOMPLETE not in text
+
+
 def test_pick_summary_no_data_is_not_the_stable_text():
     title, body = R.pick_summary(False, False, "none", has_data=False)
     assert title == "⚪ الخلاصة"

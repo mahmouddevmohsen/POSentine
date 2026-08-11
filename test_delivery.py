@@ -632,6 +632,30 @@ def test_workflow_secrets_by_name_only():
     _assert_no_hardcoded_env_values(text)
 
 
+def _assert_timeout_spec(text: str) -> None:
+    """H1: the deliver job carries a bounded timeout-minutes.
+
+    No timeout at all falls back to GitHub's 360-minute default — a hung
+    run would occupy the posentine-delivery concurrency group (with
+    cancel-in-progress: false) for up to 6 hours, silently delaying every
+    scheduled tick behind it. The bound must exist and be sane: real runs
+    take 14-26s and the worst legitimate case (cold pip cache + slow
+    Supabase + Telegram retries) is ~2-3 min, so a bound in [1, 60] is
+    generous margin against false positives on slow-but-healthy runs while
+    still dying well before the 15-min cron interval queues the next tick
+    behind a hang.
+    """
+    jobs = _block(text, "jobs:", None)
+    m = re.search(r"timeout-minutes:\s*(\d+)", jobs)
+    assert m, "deliver job has no timeout-minutes"
+    minutes = int(m.group(1))
+    assert 1 <= minutes <= 60, f"timeout-minutes {minutes} outside [1, 60]"
+
+
+def test_workflow_has_bounded_job_timeout():
+    _assert_timeout_spec(_workflow_text())
+
+
 def test_workflow_fails_loudly_and_is_isolated():
     text = _workflow_text()
     # a delivery system that fails silently is worse than one that does
@@ -675,3 +699,71 @@ def test_workflow_spec_checks_can_fire():
             text.replace("SHIFT_DATE: ${{ inputs.shift_date }}",
                          "SHIFT_DATE: ${{ inputs.shift_date }}\n"
                          "          MY_TOKEN: abc-123"))
+    # the timeout spec fires: removed and blown-past-60 both trip it
+    _assert_timeout_spec(text)
+    with pytest.raises(AssertionError):
+        _assert_timeout_spec(text.replace("timeout-minutes: 10", ""))
+    with pytest.raises(AssertionError):
+        _assert_timeout_spec(text.replace("timeout-minutes: 10",
+                                          "timeout-minutes: 120"))
+
+
+# ════════════════════════════════════════════════════════════════
+# H6 — monthly catch-up through the real entry point
+# ════════════════════════════════════════════════════════════════
+
+def test_live_run_catches_up_monthly_within_grace_window(monkeypatch):
+    """A missed day-1 run is not fatal: day 3 of the month still builds
+    the previous month's report (bounded catch-up window, H6)."""
+    set_fake_env(monkeypatch)
+    now = utc(2026, 7, 3, 4, 10)                     # Jul 3 07:10 Cairo, day 3
+    client = FakeCloud(tables=_canned(now), counts={"outbox": 0})
+    session = FakeTelegram()
+    delivery.main(["--tenant-id", TID, "--source-id", SID],
+                  client=client, now_utc=now, session=session,
+                  sleep=session.sleep)
+    monthly = [r for r in client.stores["outbox"].values()
+               if r["kind"] == "monthly_products"]
+    assert len(monthly) == 1
+    assert monthly[0]["dedup_key"] == "monthly:2026-06"
+    assert monthly[0]["status"] == "sent"
+
+
+def test_live_run_skips_monthly_after_grace_window(monkeypatch):
+    """Past the bounded window the monthly report is never rebuilt — the
+    month's data is stale enough that a late report would mislead more
+    than inform (documented at MONTHLY_CATCHUP_DAYS)."""
+    set_fake_env(monkeypatch)
+    now = utc(2026, 7, 8, 4, 10)                     # Jul 8 07:10 Cairo, day 8
+    client = FakeCloud(tables=_canned(now), counts={"outbox": 0})
+    session = FakeTelegram()
+    delivery.main(["--tenant-id", TID, "--source-id", SID],
+                  client=client, now_utc=now, session=session,
+                  sleep=session.sleep)
+    monthly = [r for r in client.stores["outbox"].values()
+               if r["kind"] == "monthly_products"]
+    assert monthly == []
+
+
+# ════════════════════════════════════════════════════════════════
+# H8 — dry-run surfaces the heartbeat-gap distribution
+# ════════════════════════════════════════════════════════════════
+
+def test_dry_run_prints_heartbeat_coverage(monkeypatch, capsys):
+    """The owner's sanity-check of the 20-minute coverage threshold needs
+    data, not reasoning: the dry-run prints the gap distribution and the
+    selected shift's own max gap (H8, read-only)."""
+    set_fake_env(monkeypatch)
+    now = utc(2026, 7, 1, 4, 10)
+    client = FakeCloud(tables=_canned(now, outbox=[obox(1)]))
+    delivery.main(["--tenant-id", TID, "--source-id", SID, "--dry-run"],
+                  client=client, now_utc=now)
+    out = capsys.readouterr().out
+    assert "heartbeat coverage" in out
+    # the canned pair is 14h apart — a real outage-shaped gap
+    assert "max_gap_min=" in out
+    assert "count=2" in out
+    assert "gaps_ge_20=1" in out
+    # still fully read-only: nothing enqueued, nothing claimed
+    writes = [c for c in client.calls if c[0] in ("insert_ignore", "insert", "update")]
+    assert writes == []

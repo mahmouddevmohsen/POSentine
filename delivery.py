@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import os
+import zoneinfo
 from typing import Any
 
 import metrics as M
@@ -152,6 +153,21 @@ def main(argv: list[str] | None = None, *,
         print("\n[orchestrator] decided (dry run):")
         for line in _safe_plan_summary(decided):
             print(line)
+        # H8 — heartbeat-gap distribution for the owner's sanity-check of
+        # the 20-minute coverage threshold (hardening plan §7.1): read-only,
+        # from the state the plan just consumed.
+        tz = zoneinfo.ZoneInfo(ctx.timezone)
+        target_gap = None
+        if decided.shift_row is not None:
+            start, end = M.shift_window(
+                _dt.date.fromisoformat(decided.shift_row["shift_date"]),
+                decided.shift_row["shift_name"])
+            target_gap = ORCH._max_heartbeat_gap_minutes(
+                state.heartbeats, start, end, tz)
+        print("\n[heartbeat coverage] "
+              "(H8 — owner check for the 20-min gap threshold):")
+        ORCH._print_heartbeat_coverage(
+            ORCH.heartbeat_gap_stats(state.heartbeats), target_gap)
         print("\n[notifier] would-send view (dry run):")
         summary = NOTIFY.run(client, tenant_id=tenant_id, source_id=source_id,
                              token=token, now_utc=now_utc, dry_run=True)

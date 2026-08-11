@@ -53,19 +53,35 @@ STATUS_STABLE = "🟢 الوردية مستقرة"
 STATUS_REVIEW = "🟡 الوردية تحتاج مراجعة"
 STATUS_CASH = "🔴 يوجد فرق يستحق المراجعة"
 STATUS_NO_DATA = "⚪ لا توجد بيانات كافية لهذه الوردية"
+# H3 (hardening phase, 2026-08-11): coverage interrupted mid-shift.
+# Same review-and-document discipline as STATUS_NO_DATA (commit 28cdc72):
+# locked-file edit, additive only, priority pinned by tests. A shift with
+# real invoices but a heartbeat gap inside its window was NOT fully
+# watched — its numbers can look valid while being incomplete.
+STATUS_INCOMPLETE = "🟠 بيانات هذه الوردية غير مكتملة"
 
 
-def pick_status(has_cash_diff: bool, has_notes: bool, has_data: bool = True) -> str:
+def pick_status(has_cash_diff: bool, has_notes: bool, has_data: bool = True,
+                has_coverage_gap: bool = False) -> str:
     """
+    الأولوية: cash_diff > no_data > coverage_gap > notes > stable.
+
     ⚠️ has_data=False (صفر فواتير في نافذة الوردية) لازم يسبق "مستقرة" —
        صفر فواتير معناه إننا مراقبناش الوردية دي، مش إنها كانت هادئة فعلاً.
        الفرق في الخزينة (لو موجود) بييجي من جدول تاني (cash_counts) ومستقل
        عن الفواتير، فبيفضل الأولوية الأعلى حتى لو مفيش فواتير.
+
+    ⚠️ has_coverage_gap (H3): فواتير موجودة لكن في انقطاع مراقبة جوه
+       الوردية — الحكم "مستقرة" كذب في الحالة دي. الفجوة أقوى من الملاحظات
+       وأضعف من "لا بيانات": وردية من غير مراقبة أصلاً ادعاء أقوى من
+       وردية مراقبة جزئي.
     """
     if has_cash_diff:
         return STATUS_CASH
     if not has_data:
         return STATUS_NO_DATA
+    if has_coverage_gap:
+        return STATUS_INCOMPLETE
     if has_notes:
         return STATUS_REVIEW
     return STATUS_STABLE
@@ -93,15 +109,22 @@ _SUMMARIES = {
     ("no_data", "*"): ("⚪ الخلاصة",
         "لا توجد فواتير مسجّلة لهذه الوردية — لا يمكن تقييمها. "
         "الأرقام أعلاه ليست نتيجة تحقّق، لأن مفيش بيانات نبني عليها الحكم."),
+    ("incomplete", "*"): ("🟠 الخلاصة",
+        "سجّلنا فواتير في هذه الوردية، لكن حدث انقطاع في مراقبة الجهاز خلال "
+        "جزء منها — الأرقام أعلاه قد لا تعكس الوردية كاملة. يُفضّل مراجعة "
+        "تغطية الرصد وتأكيد الأرقام."),
 }
 
 
 def pick_summary(has_cash_diff: bool, has_notes: bool,
-                 direction: str, has_data: bool = True) -> tuple[str, str]:
+                 direction: str, has_data: bool = True,
+                 has_coverage_gap: bool = False) -> tuple[str, str]:
     if has_cash_diff:
         return _SUMMARIES[("cash", "*")]
     if not has_data:
         return _SUMMARIES[("no_data", "*")]
+    if has_coverage_gap:
+        return _SUMMARIES[("incomplete", "*")]
     if has_notes:
         return _SUMMARIES[("notes", "*")]
     return _SUMMARIES[("stable", direction if direction in
@@ -138,6 +161,7 @@ def build_shift_report(
     cash_event: E.Event | None = None,
     had_no_count: bool = False,
     max_notes: int = 5,
+    has_coverage_gap: bool = False,
 ) -> str:
     """بيرجّع نص جاهز للإرسال. مبيحسبش أي رقم — كله جاي من metrics."""
     has_cash = cash_event is not None
@@ -145,6 +169,10 @@ def build_shift_report(
     # صفر فواتير في نافذة الوردية = مراقبناش الوردية دي (وردية قبل التركيب،
     # عطل، انقطاع اتصال...) — مش دليل إنها كانت هادئة فعلاً. ممنوع "مستقرة".
     has_data = m.total_invoices > 0
+    # H3: فواتير موجودة لكن في فجوة نبضات جوه الوردية — الرصد انقطع
+    # (عطل/نت) ولو إن المبيعات سجّلت. القيم أعلاه قد تكون ناقصة.
+    # مفيش تضارب مع has_data: صفر فواتير = ادعاء أقوى (الوردية كلها مراقبها
+    # محدش) — بييجي الأول في الأولوية.
 
     user = m.primary_user.name if m.primary_user else "غير محدد"
     L: list[str] = [
@@ -153,7 +181,7 @@ def build_shift_report(
         f"🕐 {M.shift_label_ar(m.shift_name)} — {user} · "
         f"{_hm(m.window_start)} ← {_hm(m.window_end)}",
         "",
-        pick_status(has_cash, has_notes, has_data),
+        pick_status(has_cash, has_notes, has_data, has_coverage_gap),
         "",
         f"مبيعات          {M.money(m.sales)} ج",
         f"مرتجع مبيعات    {M.money(m.returns)} ج",
@@ -198,7 +226,8 @@ def build_shift_report(
             shown.append(f"و {extra} غيرها")
         L += ["", "⚠️ ملاحظات تحتاج مراجعة"] + [f"• {n}" for n in shown]
 
-    title, body = pick_summary(has_cash, has_notes, comparison.direction, has_data)
+    title, body = pick_summary(has_cash, has_notes, comparison.direction,
+                               has_data, has_coverage_gap)
     L += ["", title, body]
 
     text = "\n".join(L)

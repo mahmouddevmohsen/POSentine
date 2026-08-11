@@ -60,6 +60,15 @@ concurrency:
 jobs:
   deliver:
     runs-on: ubuntu-latest
+    # H1 (hardening): a genuinely hung run must die before it starves the
+    # schedule. Real runs take 14-26s; the worst legitimate case (cold pip
+    # cache + slow-but-healthy Supabase + Telegram retries) is ~2-3 min.
+    # 10 min is ~30x the observed runtime, far above that worst case, and
+    # stays under the 15-min cron interval, so a hung run fails RED before
+    # the next tick would queue behind it for more than one full cycle.
+    # GitHub's 360-min default would otherwise let a hang occupy the
+    # posentine-delivery concurrency group for hours with no anomaly.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4

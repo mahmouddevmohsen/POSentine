@@ -54,9 +54,23 @@ ALERT_DEDUP = "alert:{type}:{dedup_key}"
 
 # ── limits ──────────────────────────────────────────────────────
 MAX_SHIFT_LOOKBACK_DAYS = 14      # how far back to look for a missing report
+# H2: how far back to hunt for shifts that aged out of the lookback
+# silently. Bounded (not unbounded) so a tenant's history growing over
+# years never turns the per-run scan into a pathological sweep; 60 days
+# covers any realistic multi-week outage plus a month of margin.
+MAX_AGED_GAP_DETECT_DAYS = 60
 OBSERVATION_HOURS = 24            # events are detected over the last 24h only
 DAILY_ALERT_CAP = 3               # matches events.DAILY_ALERT_CAP
 MAX_REPORT_NOTES = 5              # matches report.build_shift_report max_notes
+# H6 — the monthly report (built for the previous month) was day-1-only:
+# one missed day-1 run (a GitHub schedule delay, a Supabase outage, a
+# failed workflow) silently dropped the month's report forever. The build
+# now has a bounded catch-up window: on days 1..5 of the new month it is
+# (re)built unless the outbox already holds its dedup key. Bounded on
+# purpose — a month's data is stale enough after 5 days that a late
+# report would mislead more than inform, and an outage that long is
+# already loud via dead_man / shift_gap_aged_out.
+MONTHLY_CATCHUP_DAYS = 5
 
 # Deletion detection is trustworthy only while the agent is demonstrably
 # alive: a rescan refreshes last_seen_at for every invoice in its window,
@@ -65,6 +79,19 @@ HEARTBEAT_FRESH_MINUTES = 15      # 5 missed 3-minute cycles
 DELETION_RESCAN_MAX_AGE_MINUTES = 60   # last completed rescan
 DELETION_SEEN_MAX_AGE_MINUTES = 45     # invoice last refreshed by a rescan
 HEARTBEAT_DEAD_MINUTES = 60       # an internal dead_man anomaly fires here
+
+# H3 — mid-shift coverage gap. Heartbeats fire on a fixed ~3-minute cycle
+# REGARDLESS of sales activity (a zero-invoice cycle still heartbeats with
+# ok=true), so a silence inside a shift window means the agent or the
+# network was down — never that the shop was quiet. 20 minutes is ~6.7x the
+# normal cadence: wide enough to absorb GitHub scheduling drift and a
+# single missed cycle, tight enough to catch a real outage. Same reasoning
+# shape as HEARTBEAT_FRESH_MINUTES (15 = 5 missed cycles) and
+# DELETION_RESCAN_MAX_AGE_MINUTES (60). Sanity-checked against the agent's
+# 3-minute scheduled task cadence; flagged in the hardening plan for an
+# owner review against real heartbeats.ok=false frequency before go-live.
+COVERAGE_GAP_MINUTES = 20
+COVERAGE_GAP_PAD_MINUTES = 10   # catch a gap straddling a window boundary
 
 
 # ════════════════════════════════════════════════════════════════
@@ -148,6 +175,28 @@ class DBState:
     mirrored_heartbeat_ids: set[int] = field(default_factory=set)
     failure_heartbeats: list[dict] = field(default_factory=list)  # {"id","note"}
     open_anomaly_kinds: set[str] = field(default_factory=set)
+    # H3: heartbeat timestamps (aware UTC) within the shift-lookback
+    # window + one day, ascending — the raw material for coverage-gap
+    # detection. Empty = no heartbeats at all (nothing to detect, and
+    # dead_man covers the silence anyway).
+    heartbeats: list[_dt.datetime] = field(default_factory=list)
+    # H2: (shift_date|shift_name) keys of aged-out-gap anomalies still
+    # open in internal_anomalies — re-raising the same gap every 15
+    # minutes forever is noise, not signal (same re-arm pattern as
+    # dead_man: resolved_at closes it, a later outage raises it fresh).
+    open_aged_gap_keys: set[str] = field(default_factory=set)
+    # H6: dedup keys of monthly_products rows already in outbox — the
+    # "already enqueued" signal behind the day-1..5 catch-up window.
+    # Outbox rows are never deleted (no retention sweep exists), so this
+    # set is durable; a future retention phase must keep that coupling.
+    # Accepted edge (documented): a monthly row that went dead (e.g. bot
+    # revoked) still occupies its UNIQUE key, so the catch-up never
+    # rebuilds it — that recipient permanently misses the month, surfaced
+    # by telegram_403 / the dead row's last_error (the dead-letter design
+    # deliberately never auto-resents). Also: a recipient activated after
+    # the first build never receives that month's report (single-shot
+    # semantics, unchanged from the day-1-only design).
+    sent_monthly_keys: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -244,6 +293,114 @@ def select_shift(local_now: _dt.datetime, ctx: TenantContext,
         if (d, name) not in existing:
             return (d, name)
     return None
+
+
+def _aged_out_gaps(
+    local_now: _dt.datetime, ctx: TenantContext,
+    existing: set[tuple[_dt.date, str]],
+    max_lookback_days: int, max_detect_days: int,
+    first_sync_local: _dt.datetime | None = None,
+) -> list[tuple[_dt.date, str, _dt.datetime]]:
+    """
+    H2: closed shifts the lookback can never reach again.
+
+    MAX_SHIFT_LOOKBACK_DAYS bounds select_shift()'s candidate scan, so a
+    shift that closed beyond it and was never reported simply stops being
+    a candidate — no error, no anomaly, nothing. That is the silent-aging
+    failure mode this phase exists to kill: a multi-week outage (or a
+    bug like the one fixed in 28cdc72) leaves a permanent, invisible gap.
+
+    This pass walks the window just beyond the lookback (bounded by
+    max_detect_days so years of history never become an unbounded scan)
+    and returns every closed shift missing from `existing` — one internal
+    anomaly each, so the gap surfaces loudly instead of aging out.
+
+    Deliberately skipped: shifts whose window closed at or before
+    first_sync_local. Pre-install history is intentionally unsupported
+    (agent.py adopts MAX(salid) on first run and reads nothing behind it
+    — no backfill by design) and those shifts are recorded is_partial
+    by the normal lookback walk, so their absence is expected, not a gap.
+    """
+    today = local_now.date()
+    out: list[tuple[_dt.date, str, _dt.datetime]] = []
+    for back in range(max_lookback_days + 1, max_detect_days + 1):
+        d = today - _dt.timedelta(days=back)
+        for name in (M.MORNING, M.EVENING):
+            closes = _closes_at(d, name, ctx.shift_morning_start,
+                                ctx.shift_evening_start)
+            if closes > local_now:
+                continue                        # not closed yet
+            if (d, name) in existing:
+                continue                        # already reported/recorded
+            if first_sync_local is not None and closes <= first_sync_local:
+                continue                        # pre-install: intentional
+            out.append((d, name, closes))
+    out.sort(key=lambda c: c[2])
+    return out
+
+
+def _first_sync_local(state: DBState,
+                      tz: zoneinfo.ZoneInfo) -> _dt.datetime | None:
+    """The agent's first heartbeat, in naive POS-local wall time."""
+    if state.first_sync_at is None:
+        return None
+    return state.first_sync_at.astimezone(tz).replace(tzinfo=None)
+
+
+def _max_heartbeat_gap_minutes(
+    heartbeats: Sequence[_dt.datetime],
+    window_start: _dt.datetime, window_end: _dt.datetime,
+    tz: zoneinfo.ZoneInfo,
+    pad_minutes: int = COVERAGE_GAP_PAD_MINUTES,
+) -> float | None:
+    """
+    H3: the longest silence between consecutive heartbeats inside the
+    shift window (padded a few minutes each side to catch a gap straddling
+    a boundary), in minutes. None = too few heartbeats to judge.
+
+    Heartbeats fire on a fixed schedule regardless of sales activity, so a
+    gap means the agent or the network was down — never that the shop was
+    quiet. That is the orthogonal signal this phase needs: sales volume
+    and agent liveness are independent axes, and only the second is what
+    "coverage" actually means.
+    """
+    pad = _dt.timedelta(minutes=pad_minutes)
+    start_utc = (window_start.replace(tzinfo=tz)
+                 .astimezone(_dt.timezone.utc)) - pad
+    end_utc = (window_end.replace(tzinfo=tz)
+               .astimezone(_dt.timezone.utc)) + pad
+    in_window = sorted(h for h in heartbeats if start_utc <= h <= end_utc)
+    if len(in_window) < 2:
+        return None
+    longest = max((b - a) for a, b in zip(in_window, in_window[1:]))
+    return longest.total_seconds() / 60.0
+
+
+def heartbeat_gap_stats(
+    heartbeats: Sequence[_dt.datetime],
+    thresholds: tuple[int, ...] = (15, 20, 30),
+) -> dict:
+    """H8: inter-heartbeat gap distribution over the loaded window.
+
+    Dry-run-only observability for the owner's sanity-check of
+    COVERAGE_GAP_MINUTES (hardening plan §7.1): the 20-minute threshold
+    was chosen by reasoning about the 3-minute cadence; these numbers let
+    it be judged against real heartbeat behavior. Heartbeats fire on a
+    fixed schedule regardless of sales, so a gap here is an outage — the
+    same signal H3 uses, without the shift-window framing.
+    """
+    hb = sorted(heartbeats)
+    if len(hb) < 2:
+        return {"count": len(hb), "max_gap_minutes": None,
+                "window_span_minutes": None,
+                **{f"gaps_ge_{t}": 0 for t in thresholds}}
+    gaps = [(b - a).total_seconds() / 60.0 for a, b in zip(hb, hb[1:])]
+    return {
+        "count": len(hb),
+        "max_gap_minutes": round(max(gaps), 1),
+        "window_span_minutes": round((hb[-1] - hb[0]).total_seconds() / 60.0, 1),
+        **{f"gaps_ge_{t}": sum(1 for g in gaps if g >= t) for t in thresholds},
+    }
 
 
 # ════════════════════════════════════════════════════════════════
@@ -413,13 +570,23 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
     #      confirmed false green, reproduced live against production
     #      Supabase on 2026-08-11 (shift_report:2026-08-07/08:*, all-zero,
     #      sent to the dev chat).
-    if state.first_sync_at is not None:
-        first_sync_local = state.first_sync_at.astimezone(tz).replace(tzinfo=None)
+    first_sync_local = _first_sync_local(state, tz)
+    if first_sync_local is not None:
         straddle = start <= first_sync_local < end
         no_coverage = end <= first_sync_local
         is_partial = straddle or no_coverage
     else:
         is_partial = False
+
+    # H3 — coverage gap: a shift with real invoices but a heartbeat
+    # silence >= COVERAGE_GAP_MINUTES inside its window was NOT fully
+    # watched, so its numbers can look valid while being incomplete — the
+    # general partial-coverage false-green (Limitation 1 of the audit).
+    # Only meaningful for reported (non-partial) shifts; a quiet shift
+    # heartbeats normally, so this never flags quietness.
+    gap_minutes = _max_heartbeat_gap_minutes(state.heartbeats, start, end, tz)
+    has_coverage_gap = (not is_partial and gap_minutes is not None
+                        and gap_minutes >= COVERAGE_GAP_MINUTES)
 
     cash_diffs = sorted((e for e in cash_events if e.type == "cash_diff"
                          and start <= e.occurred_at < end),
@@ -437,7 +604,8 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
 
     body = R.build_shift_report(m, comparison, notes=notes,
                                 cash_event=cash_event, had_no_count=had_no_count,
-                                max_notes=MAX_REPORT_NOTES)
+                                max_notes=MAX_REPORT_NOTES,
+                                has_coverage_gap=has_coverage_gap)
     E.assert_no_accusation(body)
 
     out.shift_row = {
@@ -472,9 +640,15 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
 
 def _build_monthly(out: Plan, ctx: TenantContext, state: DBState,
                    local_now: _dt.datetime) -> None:
-    if local_now.day != 1:
+    # H6: build on days 1..MONTHLY_CATCHUP_DAYS, and only until the outbox
+    # holds the dedup key. The old day-1-only gate let one missed run
+    # silently lose the month's report forever; the outbox UNIQUE
+    # constraint stays the final idempotency arbiter if state is stale.
+    if local_now.day > MONTHLY_CATCHUP_DAYS:
         return
     prev = (local_now.replace(day=1) - _dt.timedelta(days=1)).date()
+    if MONTHLY_DEDUP.format(year=prev.year, month=prev.month) in state.sent_monthly_keys:
+        return
     mstart = _dt.datetime(prev.year, prev.month, 1)
     nxt = (_dt.datetime(prev.year + 1, 1, 1) if prev.month == 12
            else _dt.datetime(prev.year, prev.month + 1, 1))
@@ -508,7 +682,9 @@ def _parse_note(note: str | None) -> dict | None:
 
 
 def _build_anomalies(out: Plan, ctx: TenantContext, state: DBState,
-                     now_utc: _dt.datetime) -> None:
+                     now_utc: _dt.datetime,
+                     pos_now: _dt.datetime,     # naive POS-local wall time
+                     tz: zoneinfo.ZoneInfo) -> None:
     # dead_man — the Phase 1 handoff's mandated "alert on heartbeat silence".
     if state.heartbeat_at is None or \
        (now_utc - state.heartbeat_at) > _dt.timedelta(minutes=HEARTBEAT_DEAD_MINUTES):
@@ -528,6 +704,37 @@ def _build_anomalies(out: Plan, ctx: TenantContext, state: DBState,
         # the agent is alive again — close the open alert so a later
         # outage can raise a fresh one (resolved_at is our "re-armed" flag)
         out.resolve_dead_man = True
+
+    # H2 — silent aging: shifts that closed beyond the lookback and were
+    # never reported stop being candidates forever. One internal anomaly
+    # per newly-discovered gap, deduped on the open set so the cron (every
+    # 15 min) does not re-raise the same gap until it is resolved.
+    #
+    # Guard: only run when the agent demonstrably exists (first_sync_at
+    # set). With NO heartbeats at all there is no coverage to have gaps
+    # in — every missing shift is "legitimate absence", and dead_man
+    # already surfaces the no-agent case loudly. Without this guard a
+    # never-connected tenant would raise ~90 noise anomalies in one run.
+    first_sync_local = _first_sync_local(state, tz)
+    if state.first_sync_at is not None:
+        for d, name, closes in _aged_out_gaps(
+                pos_now, ctx, state.existing_reports,
+                MAX_SHIFT_LOOKBACK_DAYS, MAX_AGED_GAP_DETECT_DAYS,
+                first_sync_local=first_sync_local):
+            key = f"{d.isoformat()}|{name}"
+            if key in state.open_aged_gap_keys:
+                continue
+            out.anomalies.append({
+                "tenant_id": ctx.tenant_id,
+                "source_id": ctx.source_id,
+                "kind": "shift_gap_aged_out",
+                "detail": json.dumps({
+                    "shift_date": d.isoformat(),
+                    "shift_name": name,
+                    "window_end": closes.isoformat(),
+                    "age_days": (pos_now.date() - closes.date()).days,
+                }, ensure_ascii=False, default=str),
+            })
 
     # Mirror every unmirrored ok=false heartbeat note (the agent's only
     # anomaly channel; keyed on heartbeat id so re-runs cannot duplicate).
@@ -597,7 +804,7 @@ def plan(now_utc: _dt.datetime, ctx: TenantContext, state: DBState,
 
     _build_monthly(out, ctx, state, local_now)
 
-    _build_anomalies(out, ctx, state, now_utc)
+    _build_anomalies(out, ctx, state, now_utc, pos_now, tz)
 
     return out
 
@@ -684,6 +891,32 @@ def _load_state(client: supa.Supa, ctx: TenantContext,
                                    "order": "at.desc", "limit": "50"},
                                   paginate=False)
 
+    # H3: heartbeat continuity for coverage-gap detection. Bounded to the
+    # shift lookback window + one day — the only shifts that can ever be
+    # selected and reported — so a tenant's heartbeat history growing over
+    # years never turns this into a full-history fetch every 15 minutes.
+    # Volume: ~480 beats/day x 15 days = ~7.2k rows for a long-running
+    # tenant, comparable to the already-accepted invoice_lines fetch
+    # (which is an order of magnitude larger in practice); for a fresh
+    # tenant the first_sync bound below shrinks it to days, not months.
+    # A tighter "only the target shift's window" fetch was considered and
+    # rejected: the target is only known inside pure plan(), and a
+    # post-outage target can legitimately sit up to 14 days back — scoping
+    # the fetch to the recent window would silently disable the check
+    # exactly when it matters most. Shifts entirely before the agent
+    # existed are is_partial and never reported, so their lack of beats is
+    # already handled.
+    hb_since = now_utc - _dt.timedelta(days=MAX_SHIFT_LOOKBACK_DAYS + 1)
+    if beats_first:
+        first_at = _parse_dt(beats_first[0]["at"])
+        if first_at is not None and first_at - _dt.timedelta(days=1) > hb_since:
+            hb_since = first_at - _dt.timedelta(days=1)
+    heartbeats = sorted(
+        h for h in (_parse_dt(r["at"]) for r in client.select(
+            "heartbeats", {**scope, "select": "at",
+                           "at": f"gte.{hb_since.isoformat(timespec='seconds')}"}))
+        if h is not None)
+
     existing = {( _dt.date.fromisoformat(r["shift_date"]), r["shift_name"])
                 for r in client.select("shift_reports",
                                        {**scope, "select": "shift_date,shift_name"})}
@@ -732,23 +965,34 @@ def _load_state(client: supa.Supa, ctx: TenantContext,
                                         {**scope, "select": "itid,is_modifier"})
                  if r.get("itid") is not None}
 
-    # day 1 of the local month: the previous month's data for the monthly report
+    # H6 — monthly report source data. Fetched on the day-1..5 catch-up
+    # window (not day 1 only) and only until the report is actually
+    # enqueued: a missed day-1 run must still be able to build it, and a
+    # successful day-1 run must not re-fetch a whole month of rows on
+    # every 15-minute tick for the rest of the window. The outbox row is
+    # the durable "sent" signal (outbox rows are never deleted; H6's
+    # sent_monthly_keys depends on that, documented at the DBState field).
+    sent_monthly: set[str] = set()
     month_invoices: list[Inv] = []
     month_lines: list[Line] = []
-    if local_now.day == 1:
+    if local_now.day <= MONTHLY_CATCHUP_DAYS:
+        sent_monthly = {r["dedup_key"] for r in client.select(
+            "outbox", {"tenant_id": f"eq.{tid}", "channel": "eq.telegram",
+                       "kind": "eq.monthly_products", "select": "dedup_key"})}
         prev = (local_now.replace(day=1) - _dt.timedelta(days=1)).date()
-        mstart = _dt.datetime(prev.year, prev.month, 1)
-        nxt = (_dt.datetime(prev.year + 1, 1, 1) if prev.month == 12
-               else _dt.datetime(prev.year, prev.month + 1, 1))
-        band = (f"and=(sold_at.gte.{mstart.isoformat(timespec='seconds')},"
-                f"sold_at.lt.{nxt.isoformat(timespec='seconds')})")
-        month_invoices = [_row_inv(r) for r in client.select("invoices", {
-            **scope, "and": band,
-            "select": ("salid,receipt_num,sold_at,total,delivery_cost,user_uid,"
-                       "kind,first_seen_at,last_seen_at,deleted_at")})]
-        month_lines = [_row_line(r) for r in client.select("invoice_lines", {
-            **scope, "and": band,
-            "select": ("saledeid,salid,itid,item_name,list_price,qty,line_total,sold_at")})]
+        if MONTHLY_DEDUP.format(year=prev.year, month=prev.month) not in sent_monthly:
+            mstart = _dt.datetime(prev.year, prev.month, 1)
+            nxt = (_dt.datetime(prev.year + 1, 1, 1) if prev.month == 12
+                   else _dt.datetime(prev.year, prev.month + 1, 1))
+            band = (f"and=(sold_at.gte.{mstart.isoformat(timespec='seconds')},"
+                    f"sold_at.lt.{nxt.isoformat(timespec='seconds')})")
+            month_invoices = [_row_inv(r) for r in client.select("invoices", {
+                **scope, "and": band,
+                "select": ("salid,receipt_num,sold_at,total,delivery_cost,user_uid,"
+                           "kind,first_seen_at,last_seen_at,deleted_at")})]
+            month_lines = [_row_line(r) for r in client.select("invoice_lines", {
+                **scope, "and": band,
+                "select": ("saledeid,salid,itid,item_name,list_price,qty,line_total,sold_at")})]
 
     # internal_anomalies: which dead-man is already open, and which
     # heartbeat ids have already been mirrored.
@@ -756,13 +1000,20 @@ def _load_state(client: supa.Supa, ctx: TenantContext,
                                  {**scope, "select": "kind,detail,resolved_at"})
     open_kinds = {r["kind"] for r in anomaly_rows if r.get("resolved_at") is None}
     mirrored: set[int] = set()
+    open_aged_gap_keys: set[str] = set()
     for r in anomaly_rows:
         try:
             d = json.loads(r.get("detail") or "{}")
         except ValueError:
             continue
-        if isinstance(d, dict) and d.get("heartbeat_id") is not None:
+        if not isinstance(d, dict):
+            continue
+        if d.get("heartbeat_id") is not None:
             mirrored.add(int(d["heartbeat_id"]))
+        if (r.get("kind") == "shift_gap_aged_out"
+                and r.get("resolved_at") is None
+                and d.get("shift_date") and d.get("shift_name")):
+            open_aged_gap_keys.add(f"{d['shift_date']}|{d['shift_name']}")
 
     return DBState(
         existing_reports=existing,
@@ -784,6 +1035,9 @@ def _load_state(client: supa.Supa, ctx: TenantContext,
         failure_heartbeats=[{"id": b.get("id"), "note": b.get("note")}
                             for b in failure_beats],
         open_anomaly_kinds=open_kinds,
+        heartbeats=heartbeats,
+        open_aged_gap_keys=open_aged_gap_keys,
+        sent_monthly_keys=sent_monthly,
     )
 
 
@@ -928,7 +1182,15 @@ def main(argv: list[str] | None = None) -> int:
         state = _load_state(client, ctx, now_utc)
         out = plan(now_utc, ctx, state, force_shift=args.force_shift,
                    shift_date=args.shift_date)
-        _print_plan(out)
+        tz = zoneinfo.ZoneInfo(ctx.timezone)
+        target_gap = None
+        if out.shift_row is not None:
+            start, end = M.shift_window(
+                _dt.date.fromisoformat(out.shift_row["shift_date"]),
+                out.shift_row["shift_name"])
+            target_gap = _max_heartbeat_gap_minutes(state.heartbeats, start, end, tz)
+        _print_plan(out, gap_stats=heartbeat_gap_stats(state.heartbeats),
+                    target_gap_minutes=target_gap)
         return 0
     run(client, tenant_id=args.tenant_id, source_id=args.source_id,
         now_utc=now_utc, force_shift=args.force_shift,
@@ -936,7 +1198,8 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _print_plan(out: Plan) -> None:
+def _print_plan(out: Plan, gap_stats: dict | None = None,
+                target_gap_minutes: float | None = None) -> None:
     """dry-run output: the full Arabic report bodies, no secrets anywhere."""
     print("=" * 62)
     print("POSentine orchestrator — DRY RUN (nothing enqueued, nothing sent)")
@@ -958,7 +1221,31 @@ def _print_plan(out: Plan) -> None:
     print(f"  events to record : {len(out.event_rows)} "
           f"(queued: {len(out.queue_keys)})")
     print(f"  internal anomalies: {len(out.anomalies)}")
+    if gap_stats is not None:
+        print("-" * 62)
+        _print_heartbeat_coverage(gap_stats, target_gap_minutes)
     print("=" * 62)
+
+
+def _print_heartbeat_coverage(gap_stats: dict,
+                              target_gap_minutes: float | None) -> None:
+    """H8: the heartbeat-gap distribution, for the dry-run owner review."""
+    print("  heartbeat coverage (H8 — owner check for the 20-min gap threshold):")
+    if (gap_stats.get("count") or 0) < 2:
+        print(f"    heartbeats in window: {gap_stats.get('count', 0)} "
+              f"— too few to judge coverage")
+        return
+    print(f"    count={gap_stats['count']} "
+          f"span_min={gap_stats['window_span_minutes']} "
+          f"max_gap_min={gap_stats['max_gap_minutes']} "
+          f"gaps_ge_15={gap_stats['gaps_ge_15']} "
+          f"gaps_ge_20={gap_stats['gaps_ge_20']} "
+          f"gaps_ge_30={gap_stats['gaps_ge_30']}")
+    if target_gap_minutes is not None:
+        verdict = ("FLAGGED" if target_gap_minutes >= COVERAGE_GAP_MINUTES
+                   else "ok")
+        print(f"    selected-shift max gap: {target_gap_minutes} min "
+              f"(COVERAGE_GAP_MINUTES={COVERAGE_GAP_MINUTES}) -> {verdict}")
 
 
 if __name__ == "__main__":

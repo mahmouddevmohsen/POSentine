@@ -56,6 +56,13 @@ MAX_ATTEMPTS = 3                  # outbox: failed(≤3) → dead
 BACKOFF_BASE_SECONDS = 0.5
 BACKOFF_CAP_SECONDS = 30.0
 DEFAULT_TIMEOUT = 30
+# H4: how old a 'sending' row must be before it is surfaced as stuck.
+# Generous relative to send_message's own worst case (3 attempts x 30s
+# timeout + backoff — comfortably under a minute in practice): 15 minutes
+# is an order of magnitude of margin, so a slow-but-healthy send can
+# never false-positive while a crash-orphaned row surfaces within a
+# quarter hour. Same reasoning shape as HEARTBEAT_FRESH_MINUTES=15.
+STUCK_SENDING_THRESHOLD_MINUTES = 15
 
 # The 4096 decision (Task 3 spec e): truncate with an explicit marker,
 # never split. Reasons are spelled out in apply_4096_policy.
@@ -322,24 +329,55 @@ class Summary:
     cap_deferred: int = 0
     truncated: int = 0
     telegram_403: int = 0
+    stuck_sending: int = 0          # H4: anomalies raised for orphaned rows
+    dead_surfaced: int = 0          # H9: dead-letter rows surfaced
     sent_alerts_today: int = 0
     dry_run: bool = False
     lines: list[str] = field(default_factory=list)
 
 
-def _claim(client: supa.Supa, tenant_id: str) -> list[dict]:
+def _claimed_at_supported(client: supa.Supa, tenant_id: str) -> bool:
+    """
+    H4: true once schema_v5_outbox_claimed_at.sql is applied.
+
+    The H4 code is safe to ship BEFORE the migration: a missing column
+    makes this probe raise (PostgREST PGRST204 → SupaError), the claim
+    PATCH then omits claimed_at, and the stuck-sending scan stays off.
+    When the owner applies the migration, both turn on automatically —
+    defense-in-depth on top of the documented apply→verify→deploy order.
+    """
+    try:
+        client.select("outbox", {"tenant_id": f"eq.{tenant_id}",
+                                 "select": "id,claimed_at",
+                                 "limit": "1"},
+                      paginate=False)
+        return True
+    except supa.SupaError:
+        return False
+
+
+def _claim(client: supa.Supa, tenant_id: str, now_utc: _dt.datetime,
+           claimed_at_supported: bool = True) -> list[dict]:
     """
     pending|failed → sending, in FIFO order. 'sending' is never claimed,
     so a crash between claim and mark cannot re-send — the accepted cost
     is that a row left in 'sending' by a crash is never sent (message
     loss, never duplication).
+
+    H4: the claim also timestamps the 'sending' state (claimed_at), so a
+    row orphaned by a crash can be told from one claimed moments ago —
+    the raw material for scan_stuck_sending. Skipped until the column
+    exists (see _claimed_at_supported).
     """
+    patch: dict[str, Any] = {"status": "sending"}
+    if claimed_at_supported:
+        patch["claimed_at"] = now_utc.isoformat(timespec="seconds")
     return client.update("outbox", {
         "tenant_id": f"eq.{tenant_id}",
         "channel": "eq.telegram",
         "or": "(status.eq.pending,status.eq.failed)",
         "order": "created_at.asc",
-    }, {"status": "sending"}, returning=True)
+    }, patch, returning=True)
 
 
 def _mark_failed(client: supa.Supa, row: dict, error_text: str,
@@ -352,6 +390,146 @@ def _mark_failed(client: supa.Supa, row: dict, error_text: str,
                    "last_error": (error_text or "")[:500]},
                   returning=False)
     return status
+
+
+def _open_outbox_ids(client: supa.Supa, tenant_id: str, kind: str) -> set[int]:
+    """H4/H9: outbox ids with an OPEN internal anomaly of the given kind
+    (stuck_sending, dead_outbox) — the shared re-arm guard.
+    internal_anomalies has no unique constraint (dedup is the caller's
+    job), and the cron runs every 15 minutes, so without this the same
+    row would raise a fresh anomaly every single run. resolved_at closes
+    it; a later occurrence raises it fresh."""
+    ids: set[int] = set()
+    for row in client.select("internal_anomalies",
+                             {"tenant_id": f"eq.{tenant_id}",
+                              "kind": f"eq.{kind}",
+                              "resolved_at": "is.null",
+                              "select": "detail"}):
+        try:
+            d = json.loads(row.get("detail") or "{}")
+        except (ValueError, AttributeError):
+            continue
+        oid = d.get("outbox_id") if isinstance(d, dict) else None
+        if oid is not None:
+            ids.add(int(oid))
+    return ids
+
+
+def scan_stuck_sending(
+    client: supa.Supa, ctx: ORCH.TenantContext,
+    now_utc: _dt.datetime,
+    source_id: str | None = None,
+    threshold_minutes: int = STUCK_SENDING_THRESHOLD_MINUTES,
+    supported: bool = True,
+) -> list[dict]:
+    """
+    H4: one internal anomaly per outbox row orphaned in 'sending'.
+
+    A crash after the Telegram send succeeded but before the row was
+    marked 'sent' leaves the row stuck in 'sending' — never re-claimed
+    (by design, so it can never re-send) and, until now, invisible
+    forever. This scan surfaces it: claimed_at older than the threshold
+    means orphaned. It deliberately does NOT auto-resend or
+    auto-mark-sent — Telegram's Bot API has no idempotency key and no
+    post-hoc "was message X delivered" query, so guessing wrong risks
+    exactly the duplicate-owner-message outcome this project has already
+    decided against. A human checks the Telegram chat history and decides.
+
+    Requires the outbox.claimed_at column (schema_v5). Without it the
+    signal does not exist and the scan stays off. Dedup: an already-open
+    stuck_sending anomaly for the same outbox id is not re-raised.
+    """
+    if not supported:
+        return []
+    cutoff = (now_utc - _dt.timedelta(minutes=threshold_minutes))
+    stuck = client.select("outbox", {
+        "tenant_id": f"eq.{ctx.tenant_id}",
+        "status": "eq.sending",
+        "claimed_at": f"lt.{cutoff.isoformat(timespec='seconds')}",
+        "select": "id,recipient,dedup_key,claimed_at",
+        "order": "claimed_at.asc"})
+    if not stuck:
+        return []
+    open_ids = _open_outbox_ids(client, ctx.tenant_id, "stuck_sending")
+    out: list[dict[str, Any]] = []
+    for row in stuck:
+        oid = row.get("id")
+        if oid is None or oid in open_ids:
+            continue
+        anomaly: dict[str, Any] = {
+            "tenant_id": ctx.tenant_id,
+            "kind": "stuck_sending",
+            "detail": json.dumps({
+                "outbox_id": oid,
+                "recipient": mask_chat_id(row.get("recipient")),
+                "dedup_key": row.get("dedup_key"),
+                "claimed_at": row.get("claimed_at"),
+                "threshold_minutes": threshold_minutes,
+                "note": "outbox row stuck in 'sending' — a crash after the "
+                        "Telegram send. NOT auto-resent (Telegram cannot "
+                        "confirm the earlier delivery). Check the chat.",
+            }, ensure_ascii=False),
+        }
+        if source_id:                       # same convention as _record_403
+            anomaly["source_id"] = source_id
+        out.append(anomaly)
+    return out
+
+
+def scan_dead_outbox(
+    client: supa.Supa, ctx: ORCH.TenantContext,
+    source_id: str | None = None,
+) -> list[dict]:
+    """H9: one internal anomaly per outbox row that reached the dead
+    letter, unless a 403 already surfaced it.
+
+    The dead letter is terminal by design (attempts exhausted — never
+    auto-resent), but a row that dies from anything other than a 403 was
+    previously invisible: no anomaly, no alert, nothing except a row
+    that quietly stops being claimed. This scan surfaces every dead row
+    exactly the way H4 surfaces crash-orphaned 'sending' rows. Rows
+    whose last_error names a 403 are skipped — telegram_403 already owns
+    that signal, and doubling it would be noise, not signal.
+    """
+    rows = client.select("outbox", {
+        "tenant_id": f"eq.{ctx.tenant_id}",
+        "status": "eq.dead",
+        "select": "id,recipient,dedup_key,attempts,last_error,created_at"})
+    if not rows:
+        return []
+    open_ids = _open_outbox_ids(client, ctx.tenant_id, "dead_outbox")
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        oid = row.get("id")
+        if oid is None or oid in open_ids:
+            continue
+        last_error = row.get("last_error") or ""
+        # Contract with _mark_failed: a 403 raises TelegramError(
+        # "forbidden_403", "403 ...") whose str() is stored verbatim, so
+        # the "403" prefix is exactly the send_message format — and
+        # telegram_403 already owns that signal. Anything else dying
+        # (gate, 429-exhausted, 5xx-exhausted, transport) is surfaced here.
+        if last_error.startswith("403"):
+            continue
+        anomaly: dict[str, Any] = {
+            "tenant_id": ctx.tenant_id,
+            "kind": "dead_outbox",
+            "detail": json.dumps({
+                "outbox_id": oid,
+                "recipient": mask_chat_id(row.get("recipient")),
+                "dedup_key": row.get("dedup_key"),
+                "attempts": int(row.get("attempts") or 0),
+                "created_at": row.get("created_at"),   # when the row entered
+                "last_error": last_error[:200],
+                "note": "outbox row reached the dead letter (attempts "
+                        "exhausted) and will never be re-sent. Not "
+                        "auto-resent by design — check why it failed.",
+            }, ensure_ascii=False),
+        }
+        if source_id:                       # same convention as _record_403
+            anomaly["source_id"] = source_id
+        out.append(anomaly)
+    return out
 
 
 def _record_403(client: supa.Supa, ctx: ORCH.TenantContext, row: dict,
@@ -407,6 +585,11 @@ def run(client: supa.Supa, *, tenant_id: str, token: str,
     sess = session if session is not None else requests.Session()
     sleeper = sleep if sleep is not None else time.sleep
 
+    # H4 — feature probe: write claimed_at (and run the stuck-sending
+    # scan) only once schema_v5_outbox_claimed_at.sql is applied. Safe to
+    # ship before the migration; both turn on automatically after it.
+    claimed_at_supported = _claimed_at_supported(client, tenant_id)
+
     if dry_run:
         # read-only: show what a pass would do; claim, send, write nothing
         pending = client.select("outbox", {
@@ -415,6 +598,11 @@ def run(client: supa.Supa, *, tenant_id: str, token: str,
             "or": "(status.eq.pending,status.eq.failed)",
             "order": "created_at.asc"})
         summary.claimed = len(pending)
+        # H4/H9 read-only preview: how many rows each scan would raise
+        summary.stuck_sending = len(scan_stuck_sending(
+            client, ctx, now_utc, source_id,
+            supported=claimed_at_supported))
+        summary.dead_surfaced = len(scan_dead_outbox(client, ctx, source_id))
         for row in pending:
             ok, reason = gate_check(ctx, row)
             body, truncated = apply_4096_policy(row.get("body") or "")
@@ -430,7 +618,21 @@ def run(client: supa.Supa, *, tenant_id: str, token: str,
                     summary.lines.append(f"    {line}")
         return summary
 
-    claimed = _claim(client, tenant_id)
+    # H4 — surface crash-orphaned 'sending' rows BEFORE this pass claims
+    # anything: a row claimed in this run is never stuck-yet. Internal
+    # anomalies only (ours, never the owner's).
+    for anomaly in scan_stuck_sending(client, ctx, now_utc, source_id,
+                                      supported=claimed_at_supported):
+        client.insert("internal_anomalies", [anomaly], returning=False)
+        summary.stuck_sending += 1
+
+    # H9 — surface dead-lettered rows the same way (403s already have
+    # their own anomaly; every other death was invisible until now).
+    for anomaly in scan_dead_outbox(client, ctx, source_id):
+        client.insert("internal_anomalies", [anomaly], returning=False)
+        summary.dead_surfaced += 1
+
+    claimed = _claim(client, tenant_id, now_utc, claimed_at_supported)
     # PostgREST's `order` on PATCH return is requested, but the FIFO cap
     # behaviour must not depend on it — sort here so the drain order is
     # guaranteed regardless of the gateway.
@@ -547,7 +749,8 @@ def _print_summary(s: Summary) -> None:
     print(f"  claimed={s.claimed} sent={s.sent} failed={s.failed} "
           f"dead={s.dead} gate_blocked={s.gate_blocked} "
           f"cap_deferred={s.cap_deferred} truncated={s.truncated} "
-          f"telegram_403={s.telegram_403}")
+          f"telegram_403={s.telegram_403} stuck_sending={s.stuck_sending} "
+          f"dead_surfaced={s.dead_surfaced}")
     print(f"  sent alerts today (cap {E.DAILY_ALERT_CAP}): "
           f"{s.sent_alerts_today}")
     print("=" * 62)

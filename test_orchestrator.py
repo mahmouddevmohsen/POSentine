@@ -86,7 +86,8 @@ def ctx(go_live=None, recipients=None, alert_settings=None,
 def state(existing=(), sent=0, invoices=(), lines=(), cash=(), users=None,
           modifiers=None, first_sync=None, heartbeat=None, last_rescan=None,
           rescan_from=0, month_invoices=(), month_lines=(), mirrored=(),
-          failure=(), open_kinds=(), restore=False, schema_ok=True):
+          failure=(), open_kinds=(), restore=False, schema_ok=True,
+          heartbeats=(), open_gaps=(), sent_monthly=()):
     return orchestrator.DBState(
         existing_reports=set(existing),
         sent_alerts_today=sent,
@@ -105,7 +106,10 @@ def state(existing=(), sent=0, invoices=(), lines=(), cash=(), users=None,
         month_lines=list(month_lines),
         mirrored_heartbeat_ids=set(mirrored),
         failure_heartbeats=list(failure),
-        open_anomaly_kinds=set(open_kinds))
+        open_anomaly_kinds=set(open_kinds),
+        heartbeats=list(heartbeats),
+        open_aged_gap_keys=set(open_gaps),
+        sent_monthly_keys=set(sent_monthly))
 
 
 def line(saledeid, salid, qty=1.0, list_price=50.0, item="طعمية", itid=1):
@@ -312,21 +316,39 @@ def test_multi_shift_backfill_never_leaks_a_stable_report():
 # monthly — decision 4
 # ════════════════════════════════════════════════════════════════
 
-def test_monthly_built_on_day_one_only():
+def test_monthly_built_on_day_one_and_caught_up_within_grace_window():
+    """H6: built on day 1 AND on any day in the bounded catch-up window —
+    one missed day-1 run (schedule delay, Supabase outage, failed
+    workflow) must not silently lose the month's report — but only until
+    the outbox holds its dedup key, and never after the window closes."""
     d1 = _dt.date(2026, 8, 1)
     existing = {(d1 - _dt.timedelta(days=back), n)
                 for back in range(15) for n in ("morning", "evening")}
     ml = [line(1, 1, qty=4.0, list_price=10.0, item="طعمية"),
           line(2, 2, qty=2.0, list_price=5.0, item="كولا")]
     s = state(existing=existing, month_lines=ml)
-    out = orchestrator.plan(utc(2026, 7, 31, 21, 10), ctx(), s)   # Aug 1 00:10 Cairo
+
+    # day 1 (Aug 1 00:10 Cairo) → built
+    out = orchestrator.plan(utc(2026, 7, 31, 21, 10), ctx(), s)
     monthly = [e for e in out.envelopes if e.kind == "monthly_products"]
     assert len(monthly) == 1
     assert monthly[0].dedup_key == "monthly:2026-07"
     assert "أصناف الشهر الماضي" in monthly[0].body
 
+    # day 2 (within the catch-up window) → still built; the old gate
+    # (day != 1) dropped the report forever on any missed day-1 run
     out2 = orchestrator.plan(utc(2026, 8, 1, 21, 10), ctx(), s)   # Aug 2 00:10 Cairo
-    assert not any(e.kind == "monthly_products" for e in out2.envelopes)
+    assert any(e.kind == "monthly_products" for e in out2.envelopes)
+
+    # day 2 but the outbox already holds the dedup key → nothing to do
+    s_sent = state(existing=existing, month_lines=ml,
+                   sent_monthly={"monthly:2026-07"})
+    out3 = orchestrator.plan(utc(2026, 8, 1, 21, 10), ctx(), s_sent)
+    assert not any(e.kind == "monthly_products" for e in out3.envelopes)
+
+    # day 6 (window closed) → never rebuilt
+    out4 = orchestrator.plan(utc(2026, 8, 5, 21, 10), ctx(), s)   # Aug 6 00:10 Cairo
+    assert not any(e.kind == "monthly_products" for e in out4.envelopes)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -521,6 +543,224 @@ def test_failure_heartbeat_notes_are_mirrored_exactly_once():
 def json_kind(a):
     import json
     return json.loads(a["detail"]).get("kind") or a["kind"]
+
+
+# ════════════════════════════════════════════════════════════════
+# H2 — silent aging: shifts that aged out of the 14-day lookback
+# ════════════════════════════════════════════════════════════════
+
+def _gap_keys(out) -> set[str]:
+    import json
+    return {f"{json.loads(a['detail'])['shift_date']}|"
+            f"{json.loads(a['detail'])['shift_name']}"
+            for a in out.anomalies if a["kind"] == "shift_gap_aged_out"}
+
+
+def _recent_existing(today: _dt.date) -> set[tuple[_dt.date, str]]:
+    return {(today - _dt.timedelta(days=back), name)
+            for back in range(15) for name in ("morning", "evening")}
+
+
+def test_aged_out_gaps_finds_only_shifts_beyond_the_lookback():
+    """select_shift() owns the 14-day window; _aged_out_gaps owns the rest.
+    The nearest aged-out candidate is exactly back=15 (2026-07-16 morning,
+    which closed 2026-07-16 19:00 local) — nothing newer ever appears."""
+    local_now = t(2026, 7, 31, 7, 10)
+    gaps = orchestrator._aged_out_gaps(local_now, ctx(),
+                                       _recent_existing(local_now.date()),
+                                       14, 60)
+    assert gaps, "expected at least one aged-out gap"
+    gap_dates = {(d, n) for d, n, _ in gaps}
+    # the nearest aged-out candidates are back=15 (2026-07-16)
+    assert (_dt.date(2026, 7, 16), "morning") in gap_dates
+    assert (_dt.date(2026, 7, 16), "evening") in gap_dates
+    # oldest-first order, and nothing inside the 14-day lookback is ever
+    # a gap — select_shift owns that window
+    assert max(gaps, key=lambda c: c[2]) == \
+        (_dt.date(2026, 7, 16), "evening", t(2026, 7, 17, 7, 0))
+    for back in range(15):
+        for name in ("morning", "evening"):
+            assert (local_now.date() - _dt.timedelta(days=back), name) \
+                not in gap_dates
+
+
+def test_plan_raises_gap_anomaly_once_until_resolved():
+    """The cron (every 15 min) must not re-raise the same aged-out gap
+    forever — the open-set dedup is the re-arm mechanism (same pattern as
+    dead_man: resolved_at closes it, a later outage raises it fresh)."""
+    now = utc(2026, 7, 31, 4, 10)                        # 07:10 Cairo
+    first_sync = utc(2026, 7, 1, 0, 0)
+    s = state(existing=_recent_existing(_dt.date(2026, 7, 31)),
+              first_sync=first_sync)
+    out = orchestrator.plan(now, ctx(), s)
+    keys = _gap_keys(out)
+    assert keys, "expected aged-out gap anomalies"
+    assert "2026-07-16|morning" in keys                  # the nearest gap
+    # a second run with the same gaps still open adds nothing
+    out2 = orchestrator.plan(now, ctx(),
+                             state(existing=_recent_existing(_dt.date(2026, 7, 31)),
+                                   first_sync=first_sync, open_gaps=keys))
+    assert not _gap_keys(out2)
+
+
+def test_gap_beyond_detection_window_is_not_raised():
+    """The detection pass is bounded — a tenant with years of history must
+    not trigger an unbounded scan, and gaps beyond the bound stay silent
+    (they would need the migration-era walk, which is not this phase's job)."""
+    local_now = t(2026, 7, 31, 7, 10)
+    gaps = orchestrator._aged_out_gaps(local_now, ctx(), set(), 14, 20)
+    gap_dates = {(d, n) for d, n, _ in gaps}
+    assert (_dt.date(2026, 7, 11), "morning") in gap_dates      # back=20: in
+    assert (_dt.date(2026, 7, 10), "morning") not in gap_dates  # back=21: out
+
+
+def test_pre_install_shifts_are_never_aged_out_gaps():
+    """History before the agent existed is intentionally unsupported (no
+    backfill by design) — its absence is expected, not a gap. Only shifts
+    that closed AFTER install can be missing data."""
+    local_now = t(2026, 7, 31, 7, 10)
+    first_sync_local = t(2026, 7, 20, 17, 0)               # installed Jul 20
+    gaps = orchestrator._aged_out_gaps(local_now, ctx(), set(), 14, 60,
+                                       first_sync_local=first_sync_local)
+    for _d, _n, closes in gaps:
+        assert closes > first_sync_local, "pre-install shift flagged as a gap"
+
+
+def test_aged_gap_never_claims_a_shift_still_in_the_lookback():
+    """With NOTHING reported, every shift in the last 14 days belongs to
+    select_shift (it will be walked and recorded, is_partial or not). The
+    anomaly pass must only see shifts older than the lookback."""
+    local_now = t(2026, 7, 31, 7, 10)
+    gaps = orchestrator._aged_out_gaps(local_now, ctx(), set(), 14, 60)
+    for d, _n, _closes in gaps:
+        assert (local_now.date() - d).days > 14
+
+
+def test_aged_gap_re_arms_after_resolution():
+    """Same re-arm semantics as dead_man: while the anomaly is open the
+    gap stays silent; once resolved (the open set no longer holds the
+    key), a later outage raises it fresh."""
+    now = utc(2026, 7, 31, 4, 10)
+    first_sync = utc(2026, 7, 1, 0, 0)
+    base = dict(existing=_recent_existing(_dt.date(2026, 7, 31)),
+                first_sync=first_sync)
+    keys = _gap_keys(orchestrator.plan(now, ctx(), state(**base)))
+    assert keys                                   # raised once
+    assert not _gap_keys(orchestrator.plan(now, ctx(),
+                                           state(**base, open_gaps=keys)))
+    assert _gap_keys(orchestrator.plan(now, ctx(),
+                                       state(**base)))    # resolved → fresh
+
+
+def test_no_gap_anomalies_without_any_heartbeats_at_all():
+    """A never-connected tenant (no heartbeats, no first_sync) has no
+    coverage to have gaps in — every missing shift is legitimate absence,
+    and dead_man already surfaces the no-agent case loudly. Without this
+    guard the run would raise ~90 noise anomalies."""
+    now = utc(2026, 7, 31, 4, 10)
+    out = orchestrator.plan(now, ctx(), state(existing=set()))
+    assert not any(a["kind"] == "shift_gap_aged_out" for a in out.anomalies)
+
+
+# ════════════════════════════════════════════════════════════════
+# H3 — mid-shift coverage gaps (heartbeat continuity)
+# ════════════════════════════════════════════════════════════════
+# Evening shift 2026-06-30: window 19:00→07:00 local = 16:00Z→04:00Z
+# (Cairo summer, UTC+3). Beats are aware UTC in DBState.heartbeats.
+
+EVENING_START_UTC = utc(2026, 6, 30, 16, 0)
+EVENING_END_UTC = utc(2026, 7, 1, 4, 0)
+
+
+def _cadence_beats():
+    """3-minute cadence from 15:00Z to 05:00Z — covers the window + margin."""
+    out, cur = [], utc(2026, 6, 30, 15, 0)
+    while cur <= utc(2026, 7, 1, 5, 0):
+        out.append(cur)
+        cur += _dt.timedelta(minutes=3)
+    return out
+
+
+def _shift_state_with(beats, n_invoices=3):
+    invs = [inv(i, t(2026, 6, 30, 20 + i, 0)) for i in range(1, n_invoices + 1)]
+    return state(invoices=invs, heartbeats=beats)
+
+
+def test_quiet_shift_with_normal_cadence_stays_stable():
+    """The explicit no-false-positive check the brief demands: a shift with
+    few invoices and a healthy heartbeat cadence is a genuinely quiet
+    shift, not an incomplete one — coverage and sales are independent."""
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(),
+                            _shift_state_with(_cadence_beats()))
+    body = _shift_body(out)
+    assert R.STATUS_STABLE in body
+    assert R.STATUS_INCOMPLETE not in body
+
+
+def test_mid_shift_heartbeat_gap_flags_incomplete():
+    """30 minutes of silence mid-window with real invoices on both sides:
+    the report must say incomplete, not stable — the numbers look valid
+    while coverage was interrupted."""
+    beats = [b for b in _cadence_beats()
+             if not (utc(2026, 6, 30, 18, 30) <= b < utc(2026, 6, 30, 19, 0))]
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(),
+                            _shift_state_with(beats))
+    body = _shift_body(out)
+    assert R.STATUS_INCOMPLETE in body
+    assert R.STATUS_STABLE not in body
+
+
+def test_gap_entirely_outside_the_shift_window_is_ignored():
+    """A silence before the window opened (or after it closed) says nothing
+    about this shift's coverage — it must not demote the status."""
+    beats = [b for b in _cadence_beats()
+             if not (utc(2026, 6, 30, 10, 0) <= b < utc(2026, 6, 30, 11, 0))]
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(),
+                            _shift_state_with(beats))
+    body = _shift_body(out)
+    assert R.STATUS_STABLE in body
+    assert R.STATUS_INCOMPLETE not in body
+
+
+def test_gap_below_the_threshold_is_ignored():
+    """A single missed 3-minute cycle (and GitHub's own scheduling drift)
+    must not false-positive — the 20-minute threshold absorbs it. The
+    removal window is cadence-aligned, so the real gap is exactly 18
+    minutes (18:27 → 18:45), below the 20-minute threshold."""
+    beats = [b for b in _cadence_beats()
+             if not (utc(2026, 6, 30, 18, 30) <= b < utc(2026, 6, 30, 18, 45))]
+    assert _max_gap(beats, EVENING_START_UTC, EVENING_END_UTC) < 20.0
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(),
+                            _shift_state_with(beats))
+    assert R.STATUS_STABLE in _shift_body(out)
+
+
+def test_gap_at_exactly_the_threshold_flags_incomplete():
+    """Boundary: a 20-minute silence is the smallest real outage shape the
+    threshold commits to catching — inclusive."""
+    beats = [utc(2026, 6, 30, 18, 0), utc(2026, 6, 30, 18, 20),
+             utc(2026, 6, 30, 18, 40)]
+    assert _max_gap(beats, EVENING_START_UTC, EVENING_END_UTC) == 20.0
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(),
+                            _shift_state_with(beats))
+    assert R.STATUS_INCOMPLETE in _shift_body(out)
+
+
+def test_no_heartbeats_means_no_gap_signal():
+    """Zero heartbeats at all (agent never installed / no beats fetched):
+    the coverage check must stay silent — it is dead_man's territory."""
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(),
+                            state(invoices=[inv(1, t(2026, 6, 30, 20, 0))]))
+    assert R.STATUS_INCOMPLETE not in _shift_body(out)
+
+
+def _max_gap(beats, win_start, win_end):
+    import zoneinfo as _zi
+    gap = orchestrator._max_heartbeat_gap_minutes(
+        beats, t(2026, 6, 30, 19, 0), t(2026, 7, 1, 7, 0),
+        _zi.ZoneInfo(CAIRO))
+    assert gap is not None
+    return gap
 
 
 # ════════════════════════════════════════════════════════════════
@@ -724,3 +964,86 @@ def test_no_pyodbc_in_delivery_import_closure():
     forbidden = {"pyodbc", "adapter_hdsoft", "agent", "fake_adapter", "sqlguard"}
     mods = _transitive_imports(REPO / "orchestrator.py")
     assert not (forbidden & mods), f"delivery closure imports {forbidden & mods}"
+
+
+# ════════════════════════════════════════════════════════════════
+# H6 — monthly catch-up: the _load_state side of the grace window
+# ════════════════════════════════════════════════════════════════
+
+def test_load_state_skips_month_fetch_when_monthly_already_enqueued():
+    """Once the outbox holds the monthly dedup key, the whole-month fetch
+    is skipped — no wasted 15-minute re-fetch, and the plan's build gate
+    (sent_monthly_keys) agrees with what _load_state saw."""
+    client = FakeClient(tables={**_canned_morning(), "outbox": [
+        {"tenant_id": TID, "channel": "telegram", "kind": "monthly_products",
+         "recipient": "111", "dedup_key": "monthly:2026-06",
+         "status": "sent", "created_at": "2026-07-01T00:00:00+00:00"}]},
+        counts={"outbox": 0})
+    ctx = orchestrator._load_context(client, TID, SID)
+    state = orchestrator._load_state(client, ctx, utc(2026, 7, 1, 4, 10))
+    assert state.sent_monthly_keys == {"monthly:2026-06"}
+    assert state.month_invoices == []        # June was NOT re-fetched
+    assert state.month_lines == []
+
+
+def test_load_state_fetches_month_data_in_grace_window():
+    """Day 2 (within the window) still fetches the previous month's data,
+    so a missed day-1 run can actually build the report."""
+    client = FakeClient(tables=_canned_morning(), counts={"outbox": 0})
+    ctx = orchestrator._load_context(client, TID, SID)
+    state = orchestrator._load_state(client, ctx, utc(2026, 7, 2, 4, 10))  # Jul 2
+    assert state.sent_monthly_keys == set()
+    assert len(state.month_invoices) == 1    # June data available for catch-up
+
+
+def test_load_state_skips_month_entirely_after_grace_window():
+    """Day 8: past the bounded window — no outbox probe, no month fetch.
+    The report is gone for good, by design (documented at
+    MONTHLY_CATCHUP_DAYS); an outage that long is already loud."""
+    client = FakeClient(tables=_canned_morning(), counts={"outbox": 0})
+    ctx = orchestrator._load_context(client, TID, SID)
+    state = orchestrator._load_state(client, ctx, utc(2026, 7, 8, 4, 10))  # Jul 8
+    assert state.month_invoices == []
+    assert state.sent_monthly_keys == set()
+
+
+# ════════════════════════════════════════════════════════════════
+# H8 — dry-run heartbeat-gap statistics (owner threshold check)
+# ════════════════════════════════════════════════════════════════
+
+def test_gap_stats_regular_cadence_has_no_long_gaps():
+    stats = orchestrator.heartbeat_gap_stats(_cadence_beats())
+    assert stats["count"] > 100
+    assert stats["max_gap_minutes"] <= 3.0
+    assert stats["gaps_ge_15"] == 0
+    assert stats["gaps_ge_20"] == 0
+
+
+def test_gap_stats_counts_outages_at_each_threshold():
+    """A silence counts once at every threshold it clears, and the max gap
+    is the largest ADJACENT gap (the shifted copy starts 11h after the
+    first ends — junction = 660 min), not the window span."""
+    beats = _cadence_beats() + [b + _dt.timedelta(hours=25)
+                                for b in _cadence_beats()]
+    stats = orchestrator.heartbeat_gap_stats(beats)
+    assert stats["count"] == 2 * len(_cadence_beats())
+    assert stats["max_gap_minutes"] == 660.0
+    assert stats["gaps_ge_15"] == 1
+    assert stats["gaps_ge_20"] == 1
+    assert stats["gaps_ge_30"] == 1
+
+
+def test_gap_stats_too_few_heartbeats_judges_nothing():
+    stats = orchestrator.heartbeat_gap_stats([utc(2026, 6, 30, 18, 0)])
+    assert stats["count"] == 1
+    assert stats["max_gap_minutes"] is None
+    assert stats["gaps_ge_20"] == 0
+
+
+def test_gap_stats_empty_and_unsorted_inputs_are_safe():
+    empty = orchestrator.heartbeat_gap_stats([])
+    assert empty["count"] == 0 and empty["max_gap_minutes"] is None
+    unsorted = orchestrator.heartbeat_gap_stats(
+        [utc(2026, 6, 30, 19, 0), utc(2026, 6, 30, 18, 0),
+         utc(2026, 6, 30, 18, 30)])
+    assert unsorted["max_gap_minutes"] == 30.0

@@ -70,6 +70,13 @@ def _match(row: dict, filters: dict) -> bool:
         elif isinstance(v, str) and v.startswith("gte."):
             if str(row.get(k)) < v[4:]:
                 return False
+        elif isinstance(v, str) and v.startswith("lt."):
+            # Safe only because claimed_at is always written with
+            # timespec='seconds' — ISO-8601 UTC strings sort
+            # lexicographically exactly like the timestamps they name
+            # (same assumption the pre-existing gte. branch relies on).
+            if str(row.get(k)) >= v[3:]:
+                return False
     return True
 
 
@@ -82,16 +89,34 @@ class FakeClient:
         self.outbox = {}
         self.anomalies = []
         self.calls = []
+        self.claimed_at_missing = False
         for r in (tables or {}).get("outbox", []):
             self.outbox[r["id"]] = dict(r)
 
     def select(self, table, params=None, paginate=True):
         self.calls.append(("select", table))
         params = params or {}
-        rows = [dict(r) for r in self.reads.get(table, [])
-                if _match(r, params)]
+        # H4: simulate a production Supabase where schema_v5 has NOT been
+        # applied — PostgREST answers PGRST204 for a select list that
+        # names a column that does not exist.
+        if self.claimed_at_missing and table == "outbox" \
+           and "claimed_at" in str(params.get("select", "")):
+            raise supa.SupaError(
+                "GET outbox failed: HTTP 400 PGRST204 Could not find "
+                "the 'claimed_at' column")
+        # Outbox reads come from the live store (the same table updates
+        # write), like real PostgREST — a row this pass marked dead is
+        # visible to the next pass's scan. Other tables are canned reads.
+        if table == "outbox":
+            rows = [dict(r) for r in self.outbox.values()
+                    if _match(r, params)]
+        else:
+            rows = [dict(r) for r in self.reads.get(table, [])
+                    if _match(r, params)]
         if params.get("order") == "created_at.asc":
             rows.sort(key=lambda r: r.get("created_at", ""))
+        elif params.get("order") == "claimed_at.asc":
+            rows.sort(key=lambda r: r.get("claimed_at") or "")
         return rows
 
     def count(self, table, params=None):
@@ -179,11 +204,12 @@ class FakeTelegram:
 def obox(id, kind="shift_report", recipient="111",
          dedup="shift_report:2026-06-30:evening", body="تقرير الوردية",
          status="pending", attempts=0, created_at="2026-06-30T20:00:00+00:00",
-         last_error=None):
+         last_error=None, claimed_at=None):
     return {"id": id, "tenant_id": TID, "channel": "telegram",
             "recipient": recipient, "kind": kind, "body": body,
             "dedup_key": dedup, "status": status, "attempts": attempts,
-            "created_at": created_at, "last_error": last_error}
+            "created_at": created_at, "last_error": last_error,
+            "claimed_at": claimed_at}
 
 
 def dev_recipient(**kw):
@@ -210,7 +236,8 @@ def alert_settings(notify=True):
                       "deleted_invoice", "no_sales")]
 
 
-def tables(go_live=None, recipients=None, settings=None, outbox=None):
+def tables(go_live=None, recipients=None, settings=None, outbox=None,
+           anomalies=None):
     """Canned context. Rows carry their real key columns so the fake
     client's filter-honouring select() matches them like PostgREST would."""
     rcpts = recipients if recipients is not None else [dev_recipient()]
@@ -222,6 +249,7 @@ def tables(go_live=None, recipients=None, settings=None, outbox=None):
         "recipients": [{**r, "tenant_id": TID} for r in rcpts],
         "alert_settings": [{**s, "tenant_id": TID} for s in sett],
         "outbox": outbox or [],
+        "internal_anomalies": anomalies or [],
     }
 
 
@@ -515,6 +543,183 @@ def test_cap_room_is_zero_when_over_cap():
     summary, session, client = deliver(tbl, counts={"outbox": 5})
     assert summary.sent == 0
     assert summary.cap_deferred == 1
+
+
+# ════════════════════════════════════════════════════════════════
+# H4 — outbox.claimed_at + stuck-'sending' visibility
+# ════════════════════════════════════════════════════════════════
+
+def test_claim_records_claimed_at_when_column_exists():
+    now = utc(2026, 7, 1, 4, 10)
+    tbl = tables(outbox=[obox(1)])
+    summary, session, client = deliver(tbl, responses=[_telegram_ok()], now=now)
+    assert summary.sent == 1
+    assert client.outbox[1]["claimed_at"] == "2026-07-01T04:10:00+00:00"
+
+
+def test_claim_omits_claimed_at_before_the_migration_lands():
+    """Shipped-before-migration safety: the PATCH must never reference a
+    column PostgREST does not know — that would fail the whole claim and
+    stop every delivery. The probe keeps the pre-migration world identical
+    to today's behavior."""
+    tbl = tables(outbox=[obox(1)])
+    client = FakeClient(tables=tbl)
+    client.claimed_at_missing = True
+    session = FakeTelegram([_telegram_ok()])
+    summary = TG.run(client, tenant_id=TID, token=TOKEN,
+                     now_utc=utc(2026, 7, 1, 4, 10),
+                     session=session, sleep=session.sleep)
+    assert summary.sent == 1
+    assert client.outbox[1]["claimed_at"] is None   # never written pre-migration
+
+
+def test_stuck_sending_row_raises_one_anomaly():
+    now = utc(2026, 7, 1, 4, 10)
+    old = (now - _dt.timedelta(minutes=20)).isoformat()
+    tbl = tables(outbox=[obox(1, status="sending", claimed_at=old)])
+    summary, session, client = deliver(tbl)
+    assert summary.stuck_sending == 1
+    assert len(client.anomalies) == 1
+    a = client.anomalies[0]
+    assert a["kind"] == "stuck_sending"
+    detail = json.loads(a["detail"])
+    assert detail["outbox_id"] == 1
+    assert detail["recipient"] == "****"          # chat id never in full
+    assert "111" not in json.dumps(detail)
+    # the stuck row itself is never touched and never re-sent
+    assert client.outbox[1]["status"] == "sending"
+    assert session.calls == []
+
+
+def test_stuck_sending_not_re_raised_while_open():
+    """The cron runs every 15 min — an already-open anomaly for the same
+    outbox id must not be re-raised forever (resolved_at is the re-arm)."""
+    now = utc(2026, 7, 1, 4, 10)
+    old = (now - _dt.timedelta(minutes=20)).isoformat()
+    open_anomaly = {"tenant_id": TID, "kind": "stuck_sending",
+                    "resolved_at": None,
+                    "detail": json.dumps({"outbox_id": 1})}
+    tbl = tables(outbox=[obox(1, status="sending", claimed_at=old)],
+                 anomalies=[open_anomaly])
+    summary, session, client = deliver(tbl)
+    assert summary.stuck_sending == 0
+    assert client.anomalies == []
+
+
+def test_fresh_sending_row_is_not_stuck():
+    now = utc(2026, 7, 1, 4, 10)
+    recent = (now - _dt.timedelta(minutes=2)).isoformat()
+    tbl = tables(outbox=[obox(1, status="sending", claimed_at=recent)])
+    summary, session, client = deliver(tbl)
+    assert summary.stuck_sending == 0
+    assert client.anomalies == []
+
+
+def test_stuck_scan_stays_off_without_claimed_at_column():
+    """No column, no signal: the scan must stay off until the migration
+    lands, not guess from created_at (which would flag a row claimed
+    moments ago in the same run's re-claim)."""
+    now = utc(2026, 7, 1, 4, 10)
+    old = (now - _dt.timedelta(minutes=20)).isoformat()
+    tbl = tables(outbox=[obox(1, status="sending", claimed_at=old)])
+    client = FakeClient(tables=tbl)
+    client.claimed_at_missing = True
+    session = FakeTelegram([])
+    summary = TG.run(client, tenant_id=TID, token=TOKEN,
+                     now_utc=now, session=session, sleep=session.sleep)
+    assert summary.stuck_sending == 0
+    assert client.anomalies == []
+
+
+def test_stuck_sending_dry_run_counts_without_writing():
+    now = utc(2026, 7, 1, 4, 10)
+    old = (now - _dt.timedelta(minutes=20)).isoformat()
+    tbl = tables(outbox=[obox(1, status="sending", claimed_at=old)])
+    summary, session, client = deliver(tbl, dry_run=True)
+    assert summary.stuck_sending == 1
+    assert client.anomalies == []
+    writes = [c for c in client.calls if c[0] in ("insert", "update")]
+    assert writes == []
+
+
+# ════════════════════════════════════════════════════════════════
+# H9 — dead-lettered outbox rows surfaced (non-403 deaths)
+# ════════════════════════════════════════════════════════════════
+
+def test_dead_row_raises_one_anomaly():
+    tbl = tables(outbox=[obox(1, status="dead", attempts=3,
+                              last_error="rate_limited 429 Too Many Requests")])
+    summary, session, client = deliver(tbl)
+    assert summary.dead_surfaced == 1
+    assert len(client.anomalies) == 1
+    a = client.anomalies[0]
+    assert a["kind"] == "dead_outbox"
+    detail = json.loads(a["detail"])
+    assert detail["outbox_id"] == 1
+    assert detail["attempts"] == 3
+    assert detail["recipient"] == "****"          # chat id never in full
+    assert "111" not in json.dumps(detail)
+    # the dead row is never touched and never re-sent
+    assert client.outbox[1]["status"] == "dead"
+    assert session.calls == []
+
+
+def test_dead_row_not_re_raised_while_open():
+    """Same re-arm contract as H4: an already-open dead_outbox anomaly
+    for the same outbox id is not re-raised every 15 minutes."""
+    open_anomaly = {"tenant_id": TID, "kind": "dead_outbox",
+                    "resolved_at": None,
+                    "detail": json.dumps({"outbox_id": 1})}
+    tbl = tables(outbox=[obox(1, status="dead", attempts=3,
+                              last_error="server_error 500 boom")],
+                 anomalies=[open_anomaly])
+    summary, session, client = deliver(tbl)
+    assert summary.dead_surfaced == 0
+    assert client.anomalies == []
+
+
+def test_dead_row_with_403_error_is_not_double_surfaced():
+    """telegram_403 already owns the 403 signal — the dead scan must not
+    double it (noise, not signal)."""
+    tbl = tables(outbox=[obox(1, status="dead", attempts=3,
+                              last_error="403 Forbidden: bot was kicked")])
+    summary, session, client = deliver(tbl)
+    assert summary.dead_surfaced == 0
+    assert client.anomalies == []
+
+
+def test_dead_scan_dry_run_counts_without_writing():
+    tbl = tables(outbox=[obox(1, status="dead", attempts=3,
+                              last_error="server_error 500 boom")])
+    summary, session, client = deliver(tbl, dry_run=True)
+    assert summary.dead_surfaced == 1
+    assert client.anomalies == []
+    writes = [c for c in client.calls if c[0] in ("insert", "update")]
+    assert writes == []
+
+
+def test_live_dead_row_fails_then_is_surfaced_next_pass():
+    """The real path across two passes (one shared client, like the cron):
+    pass 1 exhausts a row's attempts (non-403) and marks it dead; pass 2's
+    pre-claim scan sees the death and raises the anomaly."""
+    tbl = tables(outbox=[obox(1, status="failed", attempts=2,
+                              last_error="server_error 500 boom")])
+    client = FakeClient(tables=tbl)
+    boom = _Resp(500, {"ok": False, "error_code": 500,
+                       "description": "server boom"})
+    session1 = FakeTelegram([boom, boom, boom])     # 3 attempts in one send
+    s1 = TG.run(client, tenant_id=TID, token=TOKEN,
+                session=session1, sleep=session1.sleep)
+    assert s1.dead == 1                             # attempts 2+1 = 3 → dead
+    assert client.outbox[1]["status"] == "dead"
+    assert s1.dead_surfaced == 0                    # scan ran before the death
+    # pass 2 (nothing left to claim): the death is now visible
+    session2 = FakeTelegram([])
+    s2 = TG.run(client, tenant_id=TID, token=TOKEN,
+                session=session2, sleep=session2.sleep)
+    assert s2.dead_surfaced == 1
+    assert any(a["kind"] == "dead_outbox" for a in client.anomalies)
+    assert session2.calls == []
 
 
 # ════════════════════════════════════════════════════════════════
