@@ -72,6 +72,18 @@ So updating does NOT lose any settings, history, or data.
 You do not need to back anything up yourself, and you must
 not delete or rename the install folder during an update.
 
+YOUR BACKUPS AND config.json (how secrets are handled)
+------------------------------------------------------
+Every update saves a snapshot of the previous code into
+_backup\<timestamp>\, so a failed update can put the machine
+exactly back. Your connection settings file config.json is
+NEVER copied into that backup: it holds the SQL password and
+the agent token, and those must not sit at rest in a folder.
+Instead the updater records only the file's fingerprint
+(config.json.sha256) and checks during the update that the
+file has not changed. If it has, the update stops - loudly,
+never silently. The settings themselves stay where they are.
+
 SMALL DETAILS (only if you care)
 --------------------------------
 - The updater uses the NEWEST posentine-*.zip in Downloads.
@@ -80,17 +92,57 @@ SMALL DETAILS (only if you care)
   folder: install\update_agent.ps1 AND config.json must be next
   to it. That refusal is a message, not a failure: it means the
   bat was double-clicked from the wrong place.
-- Optional safety pin: in UPDATE_POSENTINE.bat you can paste
-  the SHA-256 of the EXACT zip file on this machine into
-  EXPECTED_SHA. If you do, the updater will REFUSE any zip
-  that does not match it. To get the SHA of the downloaded
-  file:
-      Get-FileHash C:\Users\Techno\Downloads\posentine-xxxx.zip -Algorithm SHA256
-  then paste the hash into the bat. IMPORTANT: every release
-  is rebuilt, and every rebuilt file has a NEW SHA - so only
-  paste the hash of the file that is actually on this machine.
-  Leaving it empty is safe: the updater still verifies every
-  file against the zip's own MANIFEST.txt before it installs.
+
+THE RELEASE PIN (EXPECTED_SHA) AND HOW RELEASES ARE BUILT
+---------------------------------------------------------
+UPDATE_POSENTINE.bat carries one optional knob:
+   EXPECTED_SHA  - the SHA-256 of the EXACT zip the operator
+                   downloaded, pasted into the bat. If set,
+                   the updater REFUSES any zip that does not
+                   match it - before anything is touched.
+
+The release chain, so the numbers always line up:
+
+   SOURCE (this repository)
+     -> BUILD   (python make_ship.py --zip)
+     -> ZIP     (posentine-<commit>.zip)
+     -> SHA-256 (of that exact zip)
+     -> EXPECTED_SHA pinned in UPDATE_POSENTINE.bat
+     -> verified by the updater before it stops the agent
+
+How the pin is set when a release is built:
+   1. Build the release:      python make_ship.py --zip
+   2. Hash the built zip:     Get-FileHash posentine-<commit>.zip -Algorithm SHA256
+   3. Paste that hash into    EXPECTED_SHA=  in UPDATE_POSENTINE.bat
+   4. Commit the pinned bat together with the release notes.
+
+One honest subtlety: UPDATE_POSENTINE.bat is itself a file
+INSIDE the zip, so the zip cannot contain a hash of its own
+bytes - pinning the bat changes the zip. Therefore the pin
+names the release artifact that was BUILT and VERIFIED, and a
+REBUILD of the same source produces a new zip with a new SHA.
+That is expected. If you (or an operator) ever rebuild or
+re-zip the release by hand, the old pin will (correctly)
+refuse it: re-run steps 1-4 with the new file. The same rule
+applies on the machine: only paste the SHA of the file that
+is ACTUALLY on that machine.
+
+Leaving EXPECTED_SHA empty is still safe: the updater then
+verifies every file the zip carries against the zip's own
+MANIFEST.txt before installing anything - the stronger gate
+of the two.
+
+WHY THE AGENT PAUSES WHEN THE TILL IS LOGGED OUT
+------------------------------------------------
+The scheduled task runs "only while this user is logged on"
+- that is a deliberate design choice (it needs no stored
+password and no administrator rights). If the till is logged
+out or asleep, cycles stop and resume at the next login. No
+data is lost - the watermark only ever moves forward - but
+the next shift report will say the shift's data is INCOMPLETE
+instead of pretending it is complete. That orange INCOMPLETE
+banner is the system being honest, not a fault: incomplete
+data must never be presented as complete.
 
 HOW LONG DOES IT TAKE
 ---------------------

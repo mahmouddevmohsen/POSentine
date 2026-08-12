@@ -21,6 +21,12 @@
         state.lock       the agent's own cycle lock
         _backup\         this updater's own backups
 
+    Backups: config.json is never copied - only its sha256 is recorded
+    (F-1, 2026-08-12), so the SQL password and the agent token never sit
+    at rest in _backup\. Every read or copy that can touch the LIVE
+    agent.log uses FileShare::ReadWrite with a bounded retry (the 02:16
+    OpenRead sharing-violation hardening).
+
     Phases (each stops on first failure, fail-closed):
 
         1 PRECHECK    locate + checksum the artifact, verify the live
@@ -87,6 +93,11 @@ param(
     [switch]$SkipMonitor,
     [switch]$PrecheckOnly,
     [switch]$NoRollback,
+    # Dot-source seam: defines every function but does NOT run the update.
+    # Used by test_update_agent.py to call the concurrent-safe file
+    # helpers (Get-Sha256, Read-NewLogBytes, Get-PrefixSha256,
+    # Copy-FileWithRetry, Get-LogTail) directly. Never set by the bat.
+    [switch]$SkipRun,
     # Fail-closed limits.
     [int]$MinFreeMb = 200,
     [int]$MonitorTimeoutSeconds = 480,
@@ -199,9 +210,135 @@ function Fail {
 # --------------------------------------------------------------------
 # Phase 1 helpers
 # --------------------------------------------------------------------
+# --------------------------------------------------------------------
+# concurrent-safe file access - the 02:16 production hardening
+# --------------------------------------------------------------------
+# The agent opens agent.log with shared read/write while it appends. Any
+# updater read of that LIVE log must request the same sharing and must
+# retry a bounded number of times: a transient sharing violation (a cycle
+# mid-append, log rotation) must not fail an update. A persistent refusal
+# still re-raises - failures stay real and the updater fails closed.
+# Static artifacts (the release zip, MANIFEST, report.py) never race with
+# the agent, but they use the same helpers: FileShare::ReadWrite is
+# harmless when nobody else is writing, and one proven code path beats two
+# that must each be rehearsed.
+
+function Invoke-WithRetry {
+    param(
+        [scriptblock]$Action,
+        [string]$What,
+        [int]$Attempts = 5,
+        [int]$DelayMs = 500
+    )
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            return & $Action
+        }
+        catch {
+            if ($i -eq $Attempts) {
+                Write-Log ("RETRY : {0} failed after {1} attempts - failing closed" -f $What, $Attempts)
+                throw
+            }
+            Write-Log ("RETRY : {0} transient ({1}/{2}): {3}" -f $What, $i, $Attempts, $_.Exception.Message)
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+}
+
 function Get-Sha256 {
     param([string]$Path)
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+    # Explicit shared open + bounded retry. Get-FileHash is fine for
+    # static files, but agent.log is LIVE and a reader that does not ask
+    # for the same sharing the agent uses is exactly what failed on the
+    # till at 02:16 ("being used by another process").
+    return Invoke-WithRetry -What ("hash {0}" -f $Path) -Action {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                              [IO.FileShare]::ReadWrite)
+        try {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $hash = $sha.ComputeHash($fs)
+                return ([BitConverter]::ToString($hash) -replace '-', '').ToLower()
+            }
+            finally { $sha.Dispose() }
+        }
+        finally {
+            if ($fs) { $fs.Dispose() }
+        }
+    }
+}
+
+function Read-NewLogBytes {
+    param([string]$Path, [long]$Offset, [long]$Count)
+    # Shared read + bounded retry, UTF-8 decoded. Get-Content would read
+    # the system ANSI code page and mangle the Arabic report text (the
+    # mojibake finding). A persistent refusal re-raises (fails closed).
+    return Invoke-WithRetry -What ("read new log bytes of {0}" -f $Path) -Action {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                              [IO.FileShare]::ReadWrite)
+        try {
+            $fs.Position = $Offset
+            $buf = New-Object byte[] $Count
+            $read = 0
+            while ($read -lt $Count) {
+                $n = $fs.Read($buf, $read, [int]($Count - $read))
+                if ($n -le 0) { break }
+                $read += $n
+            }
+            return [Text.Encoding]::UTF8.GetString($buf, 0, $read)
+        }
+        finally {
+            if ($fs) { $fs.Dispose() }
+        }
+    }
+}
+
+function Get-PrefixSha256 {
+    param([string]$Path, [long]$Length)
+    # sha256 of ONLY the first $Length bytes, read with shared access: a
+    # live log may legitimately grow after it was backed up, and the bytes
+    # that existed at backup time are the ones that must be unchanged.
+    return Invoke-WithRetry -What ("hash the first {0} bytes of {1}" -f $Length, $Path) -Action {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                              [IO.FileShare]::ReadWrite)
+        try {
+            $buf = New-Object byte[] $Length
+            $read = 0
+            while ($read -lt $Length) {
+                $n = $fs.Read($buf, $read, [int]($Length - $read))
+                if ($n -le 0) { break }
+                $read += $n
+            }
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $hash = $sha.ComputeHash($buf, 0, $read)
+                return ([BitConverter]::ToString($hash) -replace '-', '').ToLower()
+            }
+            finally { $sha.Dispose() }
+        }
+        finally {
+            if ($fs) { $fs.Dispose() }
+        }
+    }
+}
+
+function Copy-FileWithRetry {
+    param([string]$Source, [string]$Destination, [string]$What)
+    # Copy-Item on a LIVE log (backup runs before the task is stopped):
+    # absorb a transient sharing violation, re-raise on a persistent one.
+    Invoke-WithRetry -What $What -Action {
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    }
+}
+
+function Get-LogTail {
+    param([string]$Path, [int]$Lines = 30)
+    # Display-only helper for the success screen. Shared read + UTF-8;
+    # callers wrap this in try/catch - a live log that cannot be read
+    # right now must never fail an update that already passed every gate.
+    $all = Read-NewLogBytes -Path $Path -Offset 0 -Count (Get-Item -LiteralPath $Path).Length
+    $kept = @(($all -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last $Lines)
+    return ($kept -join "`n")
 }
 
 function Find-Artifact {
@@ -268,11 +405,30 @@ function New-Backup {
     $script:BackupDir = Join-Path $InstallRoot ("_backup\{0}" -f $stamp)
     New-Item -ItemType Directory -Path $script:BackupDir -Force | Out-Null
 
-    $stateful = @('config.json', 'state.json', 'agent.log')
+    # config.json: the SQL password and the agent token. It is never
+    # modified by an update (it is protected and refused from every
+    # artifact), so rollback never needs a plaintext copy of it - only
+    # proof it did not change. Record its sha256 instead of the file:
+    # credentials must not sit at rest in _backup\ (F-1).
+    $config = Join-Path $InstallRoot 'config.json'
+    if (Test-Path -LiteralPath $config) {
+        Set-Content -LiteralPath (Join-Path $script:BackupDir 'config.json.sha256') `
+            -Value (Get-Sha256 $config) -Encoding ascii
+        Write-Log 'BACKUP : config.json sha256 recorded (file itself not copied)'
+    }
+    else {
+        Write-Log 'BACKUP : config.json MISSING in live install'
+    }
+
+    # state.json and agent.log are copied as files. agent.log is LIVE here
+    # (backup runs before the task is stopped), so the copy goes through
+    # Copy-FileWithRetry: a cycle appending at this moment is absorbed,
+    # not fatal.
+    $stateful = @('state.json', 'agent.log')
     foreach ($name in $stateful) {
         $src = Join-Path $InstallRoot $name
         if (Test-Path -LiteralPath $src) {
-            Copy-Item -LiteralPath $src -Destination $script:BackupDir -Force
+            Copy-FileWithRetry -Source $src -Destination (Join-Path $script:BackupDir $name) -What "backup $name"
             Write-Log ("BACKUP : {0}" -f $name)
         }
         else {
@@ -362,11 +518,22 @@ function Restore-Backup {
             Write-Log ("ROLLBACK : restored {0}" -f $rel)
         }
     }
-    foreach ($name in @('config.json', 'state.json', 'agent.log')) {
+    # config.json is NOT restored: updates never modify it (only its
+    # sha256 was recorded), so there is nothing to bring back. state.json
+    # and agent.log restore the exact pre-update state; agent.log may be
+    # held by a process at rollback time, so each stateful restore is
+    # best-effort with the bounded retry - a file that cannot be written
+    # is logged, never allowed to abort the code restore.
+    foreach ($name in @('state.json', 'agent.log')) {
         $src = Join-Path $script:BackupDir $name
         if (Test-Path -LiteralPath $src) {
-            Copy-Item -LiteralPath $src -Destination (Join-Path $InstallRoot $name) -Force
-            Write-Log ("ROLLBACK : restored {0}" -f $name)
+            try {
+                Copy-FileWithRetry -Source $src -Destination (Join-Path $InstallRoot $name) -What "restore $name"
+                Write-Log ("ROLLBACK : restored {0}" -f $name)
+            }
+            catch {
+                Write-Log ("ROLLBACK : could not restore {0} (best-effort): {1}" -f $name, $_.Exception.Message)
+            }
         }
     }
     Write-Log 'ROLLBACK : done'
@@ -483,17 +650,56 @@ function Update-Code {
         }
     }
 
-    # The protected files must still be there, byte for byte.
-    foreach ($name in @('config.json', 'state.json', 'agent.log')) {
-        $live = Join-Path $InstallRoot $name
-        $bak = Join-Path $script:BackupDir $name
-        if (-not (Test-Path -LiteralPath $live)) {
-            Fail 'UPDATE' "$name disappeared during the update" 'Restore from the backup and investigate.'
-        }
-        if ((Test-Path -LiteralPath $bak) -and
-            (Get-Sha256 $live) -ne (Get-Sha256 $bak)) {
-            Fail 'UPDATE' "$name changed during the update - aborting" `
+    # The protected files must still be there, unchanged. Each is verified
+    # the way its own concurrency allows:
+    #   config.json - byte-exact against the sha256 recorded at backup
+    #                 (the file itself is never stored - F-1);
+    #   state.json  - byte-exact against its backup copy (atomic writes,
+    #                 never concurrently modified);
+    #   agent.log   - growth-tolerant prefix hash: a cycle in flight when
+    #                 the task was stopped may legitimately append between
+    #                 backup and here, so only the bytes that existed at
+    #                 backup time must match; growth is expected, a shrink
+    #                 is a hard fail.
+    $configLive = Join-Path $InstallRoot 'config.json'
+    if (-not (Test-Path -LiteralPath $configLive)) {
+        Fail 'UPDATE' 'config.json disappeared during the update' 'Restore from the backup and investigate.'
+    }
+    $configShaFile = Join-Path $script:BackupDir 'config.json.sha256'
+    if (Test-Path -LiteralPath $configShaFile) {
+        $recorded = (Get-Content -LiteralPath $configShaFile -Raw).Trim().ToLower()
+        if ((Get-Sha256 $configLive) -ne $recorded) {
+            Fail 'UPDATE' 'config.json changed during the update - aborting' `
                 'The artifact tried to touch a protected file. Rollback is automatic.'
+        }
+    }
+
+    $stateLive = Join-Path $InstallRoot 'state.json'
+    $stateBak = Join-Path $script:BackupDir 'state.json'
+    if (-not (Test-Path -LiteralPath $stateLive)) {
+        Fail 'UPDATE' 'state.json disappeared during the update' 'Restore from the backup and investigate.'
+    }
+    if ((Test-Path -LiteralPath $stateBak) -and
+        (Get-Sha256 $stateLive) -ne (Get-Sha256 $stateBak)) {
+        Fail 'UPDATE' 'state.json changed during the update - aborting' `
+            'The artifact tried to touch a protected file. Rollback is automatic.'
+    }
+
+    $logLive = Join-Path $InstallRoot 'agent.log'
+    $logBak = Join-Path $script:BackupDir 'agent.log'
+    if (-not (Test-Path -LiteralPath $logLive)) {
+        Fail 'UPDATE' 'agent.log disappeared during the update' 'Restore from the backup and investigate.'
+    }
+    if (Test-Path -LiteralPath $logBak) {
+        $bakLen = (Get-Item -LiteralPath $logBak).Length
+        if ((Get-PrefixSha256 -Path $logLive -Length $bakLen) -ne (Get-Sha256 $logBak)) {
+            Fail 'UPDATE' 'agent.log changed during the update - aborting' `
+                'The artifact tried to touch a protected file. Rollback is automatic.'
+        }
+        $liveLen = (Get-Item -LiteralPath $logLive).Length
+        if ($liveLen -lt $bakLen) {
+            Fail 'UPDATE' ("agent.log shrank during the update ({0} -> {1} bytes)" -f $bakLen, $liveLen) `
+                'A protected file lost data. Rollback is automatic.'
         }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'logs'))) {
@@ -678,14 +884,12 @@ function Monitor-NaturalCycle {
         if (Test-Path -LiteralPath $logFile) {
             $len = (Get-Item -LiteralPath $logFile).Length
             if ($len -gt $lastLen) {
-                $fs = [IO.File]::OpenRead($logFile)
-                try {
-                    $fs.Position = $lastLen
-                    $buf = New-Object byte[] ($len - $lastLen)
-                    [void]$fs.Read($buf, 0, $buf.Length)
-                    $newLog = [Text.Encoding]::UTF8.GetString($buf)
-                }
-                finally { $fs.Dispose() }
+                # Shared read + bounded retry (the 02:16 fix): the agent
+                # holds agent.log open while it appends, and OpenRead's
+                # implicit FileShare.None is exactly what failed then.
+                # A transient refusal is retried; a persistent one
+                # re-raises and the update fails closed.
+                $newLog = Read-NewLogBytes -Path $logFile -Offset $lastLen -Count ($len - $lastLen)
             }
             $lastLen = $len
         }
@@ -748,7 +952,8 @@ function Run-Confirm {
 # --------------------------------------------------------------------
 # the run
 # --------------------------------------------------------------------
-Write-Log ("UPDATE START : install={0} downloads={1}" -f $InstallRoot, $DownloadsDir)
+if (-not $SkipRun) {
+    Write-Log ("UPDATE START : install={0} downloads={1}" -f $InstallRoot, $DownloadsDir)
 Write-Log ("UPDATE START : task={0} artifact-pin={1} expected-sha={2}" -f `
     $TaskName, $(if ($ZipName) { $ZipName } else { 'newest' }),
     $(if ($ExpectedSha256) { 'configured' } else { 'none (MANIFEST is the gate)' }))
@@ -843,12 +1048,22 @@ try {
     }
     Write-Log 'CONFIRM : RESULT: OK'
 
+    # Display-only: the agent is running again, so agent.log is live. A
+    # momentary inability to read it must never fail an update that
+    # already passed every gate, so the tail is wrapped and non-fatal
+    # (shared read + UTF-8 - the old Get-Content -Tail could both throw
+    # on a locked log and mis-decode UTF-8 as ANSI).
     $tail = ''
     $logFile = Join-Path $InstallRoot 'agent.log'
     if (Test-Path -LiteralPath $logFile) {
-        $tail = (Get-Content -LiteralPath $logFile -Tail 30) -join "`n"
-        Write-LogBlock 'AGENT.LOG TAIL' $tail
+        try {
+            $tail = Get-LogTail -Path $logFile -Lines 30
+        }
+        catch {
+            Write-Log ("AGENT.LOG TAIL could not be read (display only): {0}" -f $_.Exception.Message)
+        }
     }
+    if ($tail) { Write-LogBlock 'AGENT.LOG TAIL' $tail }
 
     # ---- success ------------------------------------------------
     $commit = ''
@@ -913,4 +1128,5 @@ catch {
     Write-Host ('  Log:        {0}' -f $LogPath)
     Write-Host ('=' * 66)
     exit 1
+}
 }

@@ -24,10 +24,16 @@ verdict-parsing paths run for real.
 What is exercised for real:
   * Phase 1  — live-install file checks, artifact selection, SHA-256,
                disk space, the checksum-pin failure path
-  * Phase 2  — backup: stateful files + every code file + MANIFEST
+  * Phase 2  — backup: config.json sha256 sidecar (never the file),
+               stateful files + every code file + MANIFEST
   * Phase 4  — staging extraction, protected-name refusal, code copy,
                protected files verified byte-identical, MANIFEST +
                report.py hash verification
+  * the 02:16 regression — agent.log genuinely locked by another process:
+               transient lock absorbed by the 5x500ms retry, persistent
+               lock fails closed with nothing half-updated
+  * the concurrent-safe helpers (dot-sourced with -SkipRun): shared
+               reads, UTF-8 round-trip, growth-tolerant prefix hashing
   * Phase 5/8 — the verdict-parsing functions (via fixtures)
   * rollback — the automatic restore of previous code + MANIFEST when
                a gate fails, with config/state/agent.log preserved
@@ -52,6 +58,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -306,14 +314,24 @@ def test_full_update_rehearsal_succeeds_and_preserves_state(tmp_path):
              for n in ("config.json", "state.json", "agent.log")}
     assert before == after
 
-    # The backup holds exactly what the procedure promises.
+    # The backup holds exactly what the procedure promises. Since the
+    # F-1 hardening (2026-08-12), config.json is NEVER stored in a
+    # backup: only its sha256 is recorded, and the recorded hash must
+    # match the live file. Credentials must not sit at rest in _backup\\.
     backups = list((install / "_backup").iterdir())
     assert len(backups) == 1
     b = backups[0]
-    for name in ("config.json", "state.json", "agent.log", "backup_list.txt"):
+    assert not (b / "config.json").exists()          # F-1: no plaintext copy
+    recorded = (b / "config.json.sha256").read_text(encoding="ascii").strip().lower()
+    assert recorded == sha256(install / "config.json")
+    for name in ("state.json", "agent.log", "backup_list.txt"):
         assert (b / name).exists(), name
     assert (b / "code" / "MANIFEST.txt").exists()
     assert (b / "code" / "report.py").exists()
+    # The backup inventory must not list the config.json FILE itself
+    # (config.json.sha256 legitimately contains the substring).
+    listed = (b / "backup_list.txt").read_text(encoding="utf-8-sig").splitlines()
+    assert "config.json" not in [ln.strip() for ln in listed]
 
     # updater.log: timestamped, every stage, ending in SUCCESS.
     log = (install / "logs" / "updater.log").read_text(encoding="utf-8-sig")
@@ -321,6 +339,7 @@ def test_full_update_rehearsal_succeeds_and_preserves_state(tmp_path):
     assert "UPDATE START : install=" in log and "downloads=" in log
     for stage in ("BACKUP", "UPDATE", "PREFLIGHT", "CONFIRM", "UPDATE SUCCESS"):
         assert stage in log
+    assert "config.json sha256 recorded (file itself not copied)" in log
 
 
 @requires_powershell
@@ -500,3 +519,350 @@ def test_an_unhandled_error_after_backup_still_rolls_back(tmp_path):
     assert "ffffffffffffffffffffffffffffffffffffffff" in \
         (install / "MANIFEST.txt").read_text(encoding="utf-8")
     assert (install / "report.py").read_text(encoding="utf-8").endswith("# tweak\n")
+
+
+# ════════════════════════════════════════════════════════════════
+# the 02:16 production regression — agent.log held by the agent
+# ════════════════════════════════════════════════════════════════
+# On 2026-08-12 02:16 the shipped updater died with "being used by
+# another process": [IO.File]::OpenRead asks for FileShare.Read, which
+# collides with the agent's own read+write handle on agent.log, and the
+# old Get-Sha256 had the same flaw through Get-FileHash. The fix opens
+# with FileShare::ReadWrite — the sharing the agent itself grants — and
+# retries a bounded number of times (5 x 500 ms). These tests hold a
+# GENUINE handle on agent.log the way the agent's logger does and prove
+# the updater and its helpers survive it.
+
+
+def hold_agent_log_handle(path: Path):
+    """Open agent.log exactly the way the agent's logger does: read+write
+    access, sharing read+write. A reader that asks for less sharing (like
+    OpenRead's FileShare.Read) is refused — the 02:16 condition."""
+    import ctypes
+    from ctypes import wintypes
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x1
+    FILE_SHARE_WRITE = 0x2
+    OPEN_EXISTING = 3
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    handle = kernel32.CreateFileW(str(path), GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+                                  OPEN_EXISTING, 0, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise OSError("CreateFileW failed to hold agent.log")
+    return kernel32, handle
+
+
+def write_dotsource_script(tmp_path: Path, body: str) -> tuple[Path, Path]:
+    """Write the throwaway dot-source script. Returns (script, sandbox)."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(exist_ok=True)
+    script = tmp_path / "dotsource.ps1"
+    script.write_text(
+        ". '" + str(UPDATER).replace("'", "''") + "' -SkipRun -InstallRoot '"
+        + str(sandbox).replace("'", "''") + "'\n" + body + "\n",
+        encoding="utf-8-sig")
+    return script, sandbox
+
+
+def run_dotsourced(tmp_path: Path, body: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """Dot-source update_agent.ps1 with -SkipRun (its functions become
+    callable, nothing runs) inside a throwaway script, then execute
+    $body. -InstallRoot is pinned to the sandbox so Write-Log can never
+    touch the repository."""
+    script, _sandbox = write_dotsource_script(tmp_path, body)
+    return subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+         str(script)], capture_output=True, text=True, encoding="utf-8",
+         errors="replace", timeout=timeout)
+
+
+def lock_file_exclusive(path: Path):
+    """Open path with FILE_SHARE_NONE - a genuinely exclusive handle that
+    refuses every other open (stronger than the agent's shared handle, so
+    it also proves the retry budget). Returns (kernel32, handle)."""
+    import ctypes
+    from ctypes import wintypes
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    handle = kernel32.CreateFileW(str(path), GENERIC_READ | GENERIC_WRITE, 0,
+                                  None, OPEN_EXISTING, 0, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise OSError("CreateFileW failed to lock agent.log exclusively")
+    return kernel32, handle
+
+
+def wait_for_retry_log(sandbox: Path, timeout: float = 60.0) -> None:
+    """Block until the updater's Write-Log records a RETRY line."""
+    log = sandbox / "logs" / "updater.log"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if log.exists() and "RETRY" in log.read_text(encoding="utf-8-sig",
+                                                     errors="replace"):
+            return
+        time.sleep(0.02)
+    raise AssertionError("timed out waiting for a RETRY line in updater.log")
+
+
+@requires_powershell
+@needs_ship
+def test_full_update_succeeds_while_agent_log_is_held_open(tmp_path):
+    """The 02:16 incident, faithfully: agent.log is held open by another
+    process (the agent's exact read+write/shared handle) for the whole
+    update. The old OpenRead/Get-FileHash paths failed this; the hardened
+    updater must complete and leave every stateful file byte-identical."""
+    install, downloads, _release = build_sandbox(tmp_path)
+    kernel32, handle = hold_agent_log_handle(install / "agent.log")
+    try:
+        pf = write_fixture(tmp_path / "preflight.txt", PREFLIGHT_PASS)
+        cf = write_fixture(tmp_path / "confirm.txt", CONFIRM_PASS)
+        before = {n: sha256(install / n)
+                  for n in ("config.json", "state.json", "agent.log")}
+        result = run_updater(install, downloads, "-SkipTaskOps", "-SkipMonitor",
+                             "-PreflightTextFile", str(pf),
+                             "-ConfirmTextFile", str(cf))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "UPDATE SUCCESS" in result.stdout
+        after = {n: sha256(install / n)
+                 for n in ("config.json", "state.json", "agent.log")}
+        assert before == after
+        # The backup recorded the config hash, never the file.
+        b = next((install / "_backup").iterdir())
+        assert not (b / "config.json").exists()
+        assert (b / "config.json.sha256").exists()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+@requires_powershell
+def test_sha256_reads_agent_log_held_by_another_handle(tmp_path):
+    """The core 02:16 fix: hashing the LIVE agent.log succeeds while the
+    agent's read+write/shared handle is on the file. Get-FileHash failed
+    this; Get-Sha256 with FileShare::ReadWrite must not."""
+    log = tmp_path / "agent.log"
+    data = b"line one\nline two\n"
+    log.write_bytes(data)
+    want = hashlib.sha256(data).hexdigest()
+    p = str(log).replace("'", "''")
+    body = (
+        "$fs = New-Object System.IO.FileStream('" + p + "', "
+        "[System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, "
+        "[System.IO.FileShare]::ReadWrite)\n"
+        "try { $h = Get-Sha256 -Path '" + p + "' } finally { $fs.Dispose() }\n"
+        "Write-Output $h\n"
+    )
+    result = run_dotsourced(tmp_path, body)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().lower() == want
+
+
+@requires_powershell
+def test_sha256_survives_a_transient_lock(tmp_path):
+    """A transient exclusive lock (the agent mid-append) must be absorbed
+    by the bounded retry: the hash comes back, not an abort. The lock is
+    held from the TEST process and released the moment the updater's
+    first RETRY is logged - deterministic, no sleeps to guess."""
+    log = tmp_path / "agent.log"
+    data = b"cycle 1 ok\ncycle 2 ok\n"
+    log.write_bytes(data)
+    want = hashlib.sha256(data).hexdigest()
+    p = str(log).replace("'", "''")
+    body = (
+        "$h = Get-Sha256 -Path '" + p + "'\n"
+        "Write-Output $h\n"
+    )
+    script, sandbox = write_dotsource_script(tmp_path, body)
+    kernel32, handle = lock_file_exclusive(log)
+    try:
+        proc = subprocess.Popen(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+             str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+             text=True, encoding="utf-8", errors="replace")
+        try:
+            # First attempt fails against the lock; release just after the
+            # RETRY is logged so the next attempt (500 ms later) succeeds.
+            wait_for_retry_log(sandbox)
+        finally:
+            kernel32.CloseHandle(handle)
+        out, _ = proc.communicate(timeout=60)
+    finally:
+        kernel32.CloseHandle(handle)
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 0, out
+    assert out.strip().splitlines()[-1].strip().lower() == want
+    # Prove the retry really engaged before the release.
+    updater_log = sandbox / "logs" / "updater.log"
+    assert "transient (1/5)" in updater_log.read_text(encoding="utf-8-sig",
+                                                      errors="replace")
+
+
+@requires_powershell
+def test_sha256_fails_closed_on_a_persistent_lock(tmp_path):
+    """A lock that never releases must exhaust the retry budget and
+    re-raise — a real failure stays a failure, never a silent skip."""
+    log = tmp_path / "agent.log"
+    log.write_bytes(b"held forever\n")
+    p = str(log).replace("'", "''")
+    body = (
+        "$fs = New-Object System.IO.FileStream('" + p + "', "
+        "[System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, "
+        "[System.IO.FileShare]::None)\n"
+        "try {\n"
+        "    try { Get-Sha256 -Path '" + p + "' | Out-Null; "
+        "'UNEXPECTED SUCCESS' }\n"
+        "    catch { 'THREW: ' + $_.Exception.Message }\n"
+        "} finally { $fs.Dispose() }\n"
+    )
+    result = run_dotsourced(tmp_path, body, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "UNEXPECTED SUCCESS" not in result.stdout
+    assert "THREW:" in result.stdout
+    # The retry budget was actually spent (5 x 500 ms).
+    updater_log = tmp_path / "sandbox" / "logs" / "updater.log"
+    assert "failed after 5 attempts" in updater_log.read_text(
+        encoding="utf-8-sig", errors="replace")
+
+
+@requires_powershell
+def test_read_new_log_bytes_roundtrips_utf8(tmp_path):
+    """New log lines come back byte-identical UTF-8 — the F-4 mojibake
+    class is gone (Get-Content read the ANSI code page)."""
+    log = tmp_path / "agent.log"
+    arabic = "\u0628\u064a\u0627\u0646\u0627\u062a \u0647\u0630\u0647 " \
+             "\u0627\u0644\u0648\u0631\u062f\u064a\u0629 \u063a\u064a\u0631 " \
+             "\u0645\u0643\u062a\u0645\u0644\u0629\n"
+    data = ("2026-08-12 07:00:00 cycle ok\n" + arabic).encode("utf-8")
+    log.write_bytes(data)
+    p = str(log).replace("'", "''")
+    offset = len("2026-08-12 07:00:00 cycle ok\n".encode("utf-8"))
+    count = len(arabic.encode("utf-8"))
+    body = (
+        "$s = Read-NewLogBytes -Path '" + p + "' -Offset " + str(offset) +
+        " -Count " + str(count) + "\n"
+        "Write-Output $s\n"
+    )
+    result = run_dotsourced(tmp_path, body)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Write-Output appends one newline of its own.
+    assert result.stdout.rstrip("\r\n") == arabic.rstrip("\r\n")
+
+
+@requires_powershell
+def test_prefix_hash_tolerates_legitimate_log_growth(tmp_path):
+    """A live log that GREW between backup and verify must not be judged
+    tampered: the first N bytes (the backup's length) hash identically."""
+    log = tmp_path / "agent.log"
+    backup = tmp_path / "agent.log.bak"
+    first = (b"cycle 1\n" * 100)
+    log.write_bytes(first + b"cycle 101 (appended after backup)\n")
+    backup.write_bytes(first)
+    p = str(log).replace("'", "''")
+    b = str(backup).replace("'", "''")
+    body = (
+        "$ph = Get-PrefixSha256 -Path '" + p + "' -Length " +
+        str(len(first)) + "\n"
+        "$bh = Get-Sha256 -Path '" + b + "'\n"
+        "if ($ph -eq $bh) { 'GROWTH-OK' } else { "
+        "'MISMATCH: ' + $ph + ' vs ' + $bh }\n"
+    )
+    result = run_dotsourced(tmp_path, body)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "GROWTH-OK" in result.stdout
+
+
+@requires_powershell
+def test_prefix_hash_detects_tampering(tmp_path):
+    """A log whose backed-up prefix was actually modified must still be
+    caught — growth tolerance is not tamper tolerance."""
+    log = tmp_path / "agent.log"
+    backup = tmp_path / "agent.log.bak"
+    first = bytearray(b"trusted baseline\n" * 50)
+    backup.write_bytes(bytes(first))
+    first[100:106] = b"TAMPER"  # modify INSIDE the backed-up prefix
+    log.write_bytes(bytes(first) + b"appended later\n")
+    p = str(log).replace("'", "''")
+    b = str(backup).replace("'", "''")
+    body = (
+        "$ph = Get-PrefixSha256 -Path '" + p + "' -Length " +
+        str(len(first)) + "\n"
+        "$bh = Get-Sha256 -Path '" + b + "'\n"
+        "if ($ph -ne $bh) { 'TAMPER-DETECTED' } else { 'TAMPER-MISSED' }\n"
+    )
+    result = run_dotsourced(tmp_path, body)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "TAMPER-DETECTED" in result.stdout
+
+
+@requires_powershell
+def test_copy_file_with_retry_copies_a_shared_locked_log(tmp_path):
+    """The backup copy of agent.log must tolerate the agent's handle
+    (Copy-Item does; the retry covers the odd transient)."""
+    log = tmp_path / "agent.log"
+    data = b"some log content\n" * 20
+    log.write_bytes(data)
+    dst = tmp_path / "agent.log.bak"
+    p = str(log).replace("'", "''")
+    d = str(dst).replace("'", "''")
+    body = (
+        "$fs = New-Object System.IO.FileStream('" + p + "', "
+        "[System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, "
+        "[System.IO.FileShare]::ReadWrite)\n"
+        "try { Copy-FileWithRetry -Source '" + p + "' -Destination '" +
+        d + "' -What 'copy probe' } finally { $fs.Dispose() }\n"
+        "if (Test-Path -LiteralPath '" + d + "') { 'COPY-OK' } "
+        "else { 'COPY-MISSING' }\n"
+    )
+    result = run_dotsourced(tmp_path, body)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "COPY-OK" in result.stdout
+    assert dst.read_bytes() == data
+
+
+@requires_powershell
+def test_malformed_artifact_without_agent_py_is_refused(tmp_path):
+    """A zip that is not a ship artifact (no agent.py at its root) must be
+    refused during staging, before anything is copied."""
+    install, downloads, _release = build_sandbox(tmp_path)
+    bad = downloads / "posentine-notaship.zip"
+    with zipfile.ZipFile(bad, "w") as zf:
+        zf.writestr("posentine/README.md", "# not a ship\n")
+        zf.writestr("posentine/MANIFEST.txt", "# built from: nope\n")
+    report_before = sha256(install / "report.py")
+    result = run_updater(install, downloads, "-SkipTaskOps", "-SkipMonitor",
+                         "-NoRollback")
+    assert result.returncode == 1, result.stdout
+    assert "has no agent.py at its root" in result.stdout
+    assert sha256(install / "report.py") == report_before
+
+
+@requires_powershell
+@needs_ship
+def test_expected_sha_pin_accepts_the_matching_artifact(tmp_path):
+    """The full pin chain works: hash the built artifact, hand the hash
+    to the updater, and the same zip passes. (The pin is exactly how
+    UPDATE_POSENTINE.bat will behave once EXPECTED_SHA is set.)"""
+    install, downloads, release = build_sandbox(tmp_path)
+    pf = write_fixture(tmp_path / "preflight.txt", PREFLIGHT_PASS)
+    cf = write_fixture(tmp_path / "confirm.txt", CONFIRM_PASS)
+    artifact_sha = hashlib.sha256(release.read_bytes()).hexdigest()
+    result = run_updater(install, downloads, "-SkipTaskOps", "-SkipMonitor",
+                         "-ExpectedSha256", artifact_sha,
+                         "-PreflightTextFile", str(pf),
+                         "-ConfirmTextFile", str(cf))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "UPDATE SUCCESS" in result.stdout
+    assert "sha256 matches the configured expected value" in result.stdout
