@@ -49,7 +49,10 @@ def _hm(t: _dt.datetime) -> str:
 # حالة الوردية — جدول ثابت
 # ════════════════════════════════════════════════════════════════
 
-STATUS_STABLE = "🟢 الوردية مستقرة"
+# الوصف الإيجابي الموحّد المعتمد (2026-08-13): الوردية **مكتملة** — سواء من
+# غير أي فجوة مراقبة، أو بفجوة موضّحة (انقطاع مؤقت في المراقبة + بيانات
+# الوردية كاملة ومؤكدة). "مكتملة" حلت محل "مستقرة" حسب التنسيق المعتمد.
+STATUS_STABLE = "🟢 الوردية مكتملة"
 STATUS_REVIEW = "🟡 الوردية تحتاج مراجعة"
 STATUS_CASH = "🔴 يوجد فرق يستحق المراجعة"
 STATUS_NO_DATA = "⚪ لا توجد بيانات كافية لهذه الوردية"
@@ -62,26 +65,39 @@ STATUS_INCOMPLETE = "🟠 بيانات هذه الوردية غير مكتملة
 
 
 def pick_status(has_cash_diff: bool, has_notes: bool, has_data: bool = True,
-                has_coverage_gap: bool = False) -> str:
+                has_coverage_gap: bool = False,
+                gap_explained: bool = False) -> str:
     """
-    الأولوية: cash_diff > no_data > coverage_gap > notes > stable.
+    الأولوية: cash_diff > no_data > coverage_gap(غير موضّحة) > explained > notes > stable.
 
-    ⚠️ has_data=False (صفر فواتير في نافذة الوردية) لازم يسبق "مستقرة" —
+    ⚠️ has_data=False (صفر فواتير في نافذة الوردية) لازم يسبق "مكتملة" —
        صفر فواتير معناه إننا مراقبناش الوردية دي، مش إنها كانت هادئة فعلاً.
        الفرق في الخزينة (لو موجود) بييجي من جدول تاني (cash_counts) ومستقل
        عن الفواتير، فبيفضل الأولوية الأعلى حتى لو مفيش فواتير.
 
     ⚠️ has_coverage_gap (H3): فواتير موجودة لكن في انقطاع مراقبة جوه
-       الوردية — الحكم "مستقرة" كذب في الحالة دي. الفجوة أقوى من الملاحظات
+       الوردية — الحكم "مكتملة" كذب في الحالة دي. الفجوة أقوى من الملاحظات
        وأضعف من "لا بيانات": وردية من غير مراقبة أصلاً ادعاء أقوى من
        وردية مراقبة جزئي.
+
+    ⚠️ gap_explained (2026-08-13): الفجوة **مفسّرة** — انقطاع مؤقت في
+       المراقبة (جهاز دخل في وضع Sleep) وبيانات الوردية كاملة ومؤكدة
+       (classify_coverage_gap في orchestrator.py). الفجوة المفسّرة بتخرج من
+       الحكم، والوردية بتتقيم بشكلها الطبيعي. الفجوة من غير تفسير = incomplete.
     """
     if has_cash_diff:
         return STATUS_CASH
     if not has_data:
         return STATUS_NO_DATA
-    if has_coverage_gap:
+    if has_coverage_gap and not gap_explained:
         return STATUS_INCOMPLETE
+    # قرار 2026-08-13 (موثّق في docstring): الفجوة المفسّرة بتخرج من الحكم
+    # قبل الملاحظات — الوردية المكتملة بياناتها بتتعرض "مكتملة" حتى لو فيه
+    # عمليات للمراجعة (قسم "⚠️ ملاحظات تحتاج مراجعة" لسه ظاهر فوق الخلاصة).
+    # الحماية مش بتضعّف: الفجوة من غير تفسير / cash_diff / no_data ليهم
+    # الأولوية زي ما هي، ومفيش أي حماية بتتقفل عشان التقرير يبقى أخضر.
+    if gap_explained:
+        return STATUS_STABLE
     if has_notes:
         return STATUS_REVIEW
     return STATUS_STABLE
@@ -113,18 +129,31 @@ _SUMMARIES = {
         "سجّلنا فواتير في هذه الوردية، لكن حدث انقطاع في مراقبة الجهاز خلال "
         "جزء منها — الأرقام أعلاه قد لا تعكس الوردية كاملة. يُفضّل مراجعة "
         "تغطية الرصد وتأكيد الأرقام."),
+    # 2026-08-13 — فجوة مراقبة موضّحة (انقطاع مؤقت بسبب Sleep) وبيانات الوردية
+    # كاملة: الوردية مكتملة والانقطاع مش نقص في الوردية. النص الثلاثة أسطر
+    # بنفس صياغة الزبون المعتمدة بالحرف. ممنوع إننا نقول إننا "استرجعنا"
+    # بيانات مش مثبتة — التفسير ده بيمر بس من classify_coverage_gap اللي
+    # بيتأكد: المراقبة رجعت، واللحاق اكتمل، ومفيش نشاط POS جوه الفجوة.
+    ("gap_explained", "*"): ("🟢 الخلاصة",
+        "الوردية مكتملة وتم تسجيل بياناتها.\n"
+        "حدث انقطاع مؤقت في المراقبة بسبب دخول جهاز الكمبيوتر في وضع Sleep، "
+        "وليس بسبب نقص في الوردية نفسها.\n"
+        "تم استئناف المراقبة بعد عودة الجهاز للعمل."),
 }
 
 
 def pick_summary(has_cash_diff: bool, has_notes: bool,
                  direction: str, has_data: bool = True,
-                 has_coverage_gap: bool = False) -> tuple[str, str]:
+                 has_coverage_gap: bool = False,
+                 gap_explained: bool = False) -> tuple[str, str]:
     if has_cash_diff:
         return _SUMMARIES[("cash", "*")]
     if not has_data:
         return _SUMMARIES[("no_data", "*")]
-    if has_coverage_gap:
+    if has_coverage_gap and not gap_explained:
         return _SUMMARIES[("incomplete", "*")]
+    if gap_explained:
+        return _SUMMARIES[("gap_explained", "*")]
     if has_notes:
         return _SUMMARIES[("notes", "*")]
     return _SUMMARIES[("stable", direction if direction in
@@ -143,7 +172,8 @@ def cash_line(cash_event: E.Event | None, had_no_count: bool) -> str:
     if cash_event is None:
         if had_no_count:
             return "⏸ لم يتم جرد الخزينة في هذه الوردية"
-        return "🟢 الخزينة متطابقة"
+        # 2026-08-13: تغيير صياغة فقط — المنطق (منطق التطابق/الفروقات) كما هو.
+        return "🟢 تم تأكيد بيانات الخزينة من البيانات المسجلة"
     p = cash_event.payload
     return (f"⚠️ المتوقع {M.money(p['expected'])} ج • "
             f"الفعلي {M.money(p['actual'])} ج • "
@@ -162,17 +192,30 @@ def build_shift_report(
     had_no_count: bool = False,
     max_notes: int = 5,
     has_coverage_gap: bool = False,
+    gap_explained: bool = False,
+    withdrawals: float | None = None,
 ) -> str:
-    """بيرجّع نص جاهز للإرسال. مبيحسبش أي رقم — كله جاي من metrics."""
+    """بيرجّع نص جاهز للإرسال. مبيحسبش أي رقم — كله جاي من metrics.
+
+    withdrawals (مسحوبات): المصدر المؤكد = SUM(dbo.Personal.peramount) جوه
+    نافذة الوردية (مؤكد من تحقيق العميل + تأكيد المالك). السطر والفورمولا
+    بيتعرضوا دايماً من المتصل الحقيقي (الـorchestrator بيوفر القيمة حتى لو
+    صفر) — السطر ممنوع يختفي ولا يتحط من غير أساس. المبلغ نفسه سطر عرض بس:
+    الإجمالي محسوب بنفس الأساس في metrics.py (مبيعات + مقبوضات − مرتجع
+    − دليفري − مسحوبات).
+    """
     has_cash = cash_event is not None
     has_notes = bool(notes)
     # صفر فواتير في نافذة الوردية = مراقبناش الوردية دي (وردية قبل التركيب،
-    # عطل، انقطاع اتصال...) — مش دليل إنها كانت هادئة فعلاً. ممنوع "مستقرة".
+    # عطل، انقطاع اتصال...) — مش دليل إنها كانت هادئة فعلاً. ممنوع "مكتملة".
     has_data = m.total_invoices > 0
     # H3: فواتير موجودة لكن في فجوة نبضات جوه الوردية — الرصد انقطع
     # (عطل/نت) ولو إن المبيعات سجّلت. القيم أعلاه قد تكون ناقصة.
     # مفيش تضارب مع has_data: صفر فواتير = ادعاء أقوى (الوردية كلها مراقبها
     # محدش) — بييجي الأول في الأولوية.
+    # H9 (2026-08-13): لو الفجوة موضّحة (انقطاع مؤقت + البيانات كاملة)،
+    # التقرير بيقول "الوردية مكتملة" وبيشرح انقطاع المراقبة في الخلاصة —
+    # من غير ما يضعّف كشف الفجوات نفسه (اللي شغال في orchestrator.py).
 
     user = m.primary_user.name if m.primary_user else "غير محدد"
     L: list[str] = [
@@ -180,19 +223,61 @@ def build_shift_report(
         f"📅 {ar_date(m.shift_date)}",
         f"🕐 {M.shift_label_ar(m.shift_name)} — {user} · "
         f"{_hm(m.window_start)} ← {_hm(m.window_end)}",
-        "",
-        pick_status(has_cash, has_notes, has_data, has_coverage_gap),
-        "",
-        # الإشارات عمدية (قرار 2026-08-11): مرتجع ودليفري خطوط **خصم** مش جمع.
-        # الإجمالي = مبيعات + مقبوضات − مرتجع − دليفري — القيم نفسها مفيش منها تعديل.
-        f"مبيعات          +{M.money(m.sales)} ج",
-        f"مرتجع مبيعات     −{M.money(m.returns)} ج",
-        f"دليفري           −{M.money(m.delivery)} ج",
-        f"مقبوضات         +{M.money(m.collections)} ج",
         SEP,
-        f"الإجمالي         {M.money(m.grand_total)} ج",
-        f"الإجمالي = مبيعات + مقبوضات − مرتجع مبيعات − دليفري",
-        "",
+        pick_status(has_cash, has_notes, has_data, has_coverage_gap,
+                    gap_explained),
+        SEP,
+    ]
+
+    # موظف الوردية — من نفس مصدر الحساب (per-user aggregation في metrics.py)
+    # من غير أي حساب جديد. المثال المعتمد: "👥 محمود — 24 فاتورة (1,630 ج)".
+    #
+    # القاعدة (2026-08-13): حساب الفرع/الصاحب بيفضل في الهيدر (primary_user)،
+    # فالسطر ده بيعرض موظفين الوردية التانيين (other_users) الأول — ده اللي
+    # بيطابق المثال المعتمد (هيدر "حمص" + سطر "محمود"). لو مفيش غير
+    # المستخدم الأساسي، بيعرضه هو. لو مفيش أي مبلغ موظف صالح — مفيش سطر
+    # (ممنوع نختلق مبلغ).
+    #
+    # ⚠️ قيمة المبلغ هي مجموع فواتير المستخدم (كل الأنواع) من نفس الحساب
+    #    القديم في metrics.py — مش حساب مبيعات جديد. السطر التفصيلي
+    #    "↳ منها" عرض فقط ومبيضفش على الإجمالي (ممنوع الحساب المزدوج).
+    cashiers: list[M.UserSlice] = []
+    if m.other_users:
+        cashiers = list(m.other_users)
+    elif m.primary_user:
+        cashiers = [m.primary_user]
+    if cashiers:
+        if len(cashiers) == 1:
+            u = cashiers[0]
+            L.append(f"👥 {u.name} — {u.invoices} فاتورة "
+                     f"({M.money(u.amount)} ج) خلال الوردية")
+        else:
+            parts = [f"{u.name} — {u.invoices} فاتورة ({M.money(u.amount)} ج)"
+                     for u in cashiers]
+            L.append("👥 " + " · ".join(parts) + " خلال الوردية")
+        L.append(SEP)
+
+    # بنود يومية الخزينة — بنفس ترتيب شاشة "يومية الخزينة" المعتمدة.
+    # الإشارات عمدية: مرتجع ودليفري خطوط **خصم** مش جمع.
+    # الإجمالي = مبيعات + مقبوضات − مرتجع − دليفري — القيم نفسها مفيش منها تعديل.
+    L.append(f"مبيعات          +{M.money(m.sales)} ج")
+    if cashiers:
+        # سطر تفصيلي/مجموعة فرعية — مبيضفش أي مبلغ على الإجمالي (ممنوع
+        # الحساب المزدوج للموظف). نفس مصدر القيمة اللي في سطر الموظف.
+        L.append(f"↳ منها {cashiers[0].name}     +{M.money(cashiers[0].amount)} ج")
+    L.append(f"مقبوضات         +{M.money(m.collections)} ج")
+    L.append(f"دليفري           −{M.money(m.delivery)} ج")
+    if withdrawals is not None:
+        L.append(f"مسحوبات         −{M.money(withdrawals)} ج")
+    L.append(f"مرتجع مبيعات     −{M.money(m.returns)} ج")
+    L += [SEP, f"الإجمالي         {M.money(m.grand_total)} ج", SEP]
+
+    formula = "الإجمالي = مبيعات + مقبوضات − مرتجع مبيعات − دليفري"
+    if withdrawals is not None:
+        formula += " − مسحوبات"
+    L.append(formula)
+    L += [
+        SEP,
         f"إيصالات بيع نقدي:  {m.n_cash}",
         f"إيصالات مرتجع:     {m.n_return}",
         f"إيصالات بيع خارجي: {m.n_external}",
@@ -200,38 +285,32 @@ def build_shift_report(
     if m.n_other:
         L.append(f"إيصالات أخرى:      {m.n_other}")
 
-    L += ["", "💵 الخزينة", cash_line(cash_event, had_no_count)]
+    L += [SEP, "💵 الخزينة", cash_line(cash_event, had_no_count)]
+
+    if m.top_items:
+        medals = ("🥇", "🥈", "🥉", "4️⃣", "5️⃣")
+        L += [SEP, "🔥 أكثر 5 أصناف حركة"]
+        L += [f"{medals[i]} {n} — {q:g}"
+              for i, (n, q) in enumerate(m.top_items[:5])]
 
     # المقارنة — نفس الوردية نفس اليوم الأسبوع اللي فات
-    L += ["", f"📈 مقارنة بنفس الوردية {ar_weekday(m.shift_date)} اللي فات"]
+    L += [SEP, f"📈 مقارنة بنفس الوردية {ar_weekday(m.shift_date)} اللي فات"]
     if comparison.available:
         L.append(f"{M.money(comparison.previous_total)} ج — "
                  f"{M.comparison_text_ar(comparison)}")
     else:
         L.append(M.comparison_text_ar(comparison))
 
-    if m.top_items:
-        medals = ("🥇", "🥈", "🥉", "4️⃣", "5️⃣")
-        L += ["", "🔥 أكثر 5 أصناف حركة"]
-        L += [f"{medals[i]} {n} — {q:g}"
-              for i, (n, q) in enumerate(m.top_items[:5])]
-
-    # تدخّل مستخدم تاني — المبلغ محسوب في الإجمالي فوق
-    if m.other_users:
-        parts = [f"{u.name} {u.invoices} فاتورة ({M.money(u.amount)} ج)"
-                 for u in m.other_users]
-        L += ["", "👥 " + " · ".join(parts) + " خلال الوردية"]
-
     if has_notes:
         shown = list(notes[:max_notes])
         extra = len(notes) - len(shown)
         if extra > 0:
             shown.append(f"و {extra} غيرها")
-        L += ["", "⚠️ ملاحظات تحتاج مراجعة"] + [f"• {n}" for n in shown]
+        L += [SEP, "⚠️ ملاحظات تحتاج مراجعة"] + [f"• {n}" for n in shown]
 
     title, body = pick_summary(has_cash, has_notes, comparison.direction,
-                               has_data, has_coverage_gap)
-    L += ["", title, body]
+                               has_data, has_coverage_gap, gap_explained)
+    L += [SEP, title] + body.split("\n")
 
     text = "\n".join(L)
     E.assert_no_accusation(text)          # حارس إجباري قبل أي إرسال

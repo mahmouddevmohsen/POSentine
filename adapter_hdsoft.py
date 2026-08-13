@@ -15,6 +15,8 @@ adapter_hdsoft.py — محوّل HD Soft (قراءة فقط)
   7. إعادة المسح محدودة بـ salid (مفيش index على saldate)
   8. تجاهل الفواتير الأحدث من 30 ثانية (حماية من dirty read)
   9. ممنوع أي join بين Sales و SalesDe من غير شرط — cross join = تعليق السيرفر
+ 10. المسحوبات = dbo.Personal.peramount، الجدول بيتقرا **كله** كل دورة
+     (صغير + بيحتمل حذف/تعديل) وبيتنعكس أي حذف على السحاب في دورة واحدة.
 ================================================================
 """
 
@@ -61,6 +63,8 @@ _REQUIRED = {
     "Items": ("Itid", "itcode", "itname", "itsaleprice", "itmcat", "itscat"),
     "Users": ("UID", "Uname"),
     "safeR": ("SRID", "SrUID", "SrDate", "SrUserval", "SrAppVal", "SrDiffVal"),
+    "Personal": ("Perid", "peramount", "perdate", "peruser", "PerBRID",
+                  "pertype", "pernote"),
 }
 
 
@@ -118,6 +122,25 @@ class CashCount:
 
 
 @dataclass(slots=True)
+class Withdrawal:
+    """مسحوبات — صف واحد من جدول HD Soft dbo.Personal.
+
+    المصدر المؤكد من تحقيق العميل: Personal.peramount هو "مسحوبات"
+    يومية الخزينة، وبيتخصم من الإجمالي. القيمة بنقراها زي ما هي.
+    peruser / PerBRID / pertype / pernote بيتحفظوا كـ metadata للأدلة —
+    التجميع بالوردية (النافذة) مش بالمستخدم (ممنوع حرق أسماء الكاشير
+    في الحساب).
+    """
+    perid: int
+    amount: float                 # peramount
+    perdate: _dt.datetime         # وقت الـPOS المحلي — ممنوع تحويله
+    user_uid: int | None          # peruser
+    branch_id: int | None         # PerBRID
+    per_type: int | None          # pertype
+    note: str | None              # pernote
+
+
+@dataclass(slots=True)
 class PullResult:
     """مخرج دورة واحدة. الأجينت بيرفعها زي ما هي."""
     new_invoices: list[Invoice] = field(default_factory=list)
@@ -128,6 +151,7 @@ class PullResult:
     window_salids: list[int] = field(default_factory=list)
     window_from_salid: int = 0
     cash_counts: list[CashCount] = field(default_factory=list)
+    withdrawals: list[Withdrawal] = field(default_factory=list)
     products: list[dict[str, Any]] = field(default_factory=list)
     users: list[dict[str, Any]] = field(default_factory=list)
     date_change_rows: int = 0
@@ -270,6 +294,20 @@ def _row_to_line(r) -> InvoiceLine:
     )
 
 
+def _row_to_withdrawal(r) -> Withdrawal:
+    """عمود واحد من dbo.Personal. الأعمدة كلها بتبقى موجودة (فحص الـschema
+    في verify_schema بيضمنها) — أي قيمة غريبة بنحولها بس مش بنسقط الصف."""
+    return Withdrawal(
+        perid=int(r.Perid),
+        amount=float(r.peramount or 0),
+        perdate=r.perdate,
+        user_uid=int(r.peruser) if r.peruser is not None else None,
+        branch_id=int(r.PerBRID) if r.PerBRID is not None else None,
+        per_type=int(r.pertype) if r.pertype is not None else None,
+        note=(r.pernote or "").strip() or None,
+    )
+
+
 def _fetch_lines_for(cur, salids: list[int]) -> list[InvoiceLine]:
     """سحب السطور على دفعات — SQL Server حده 2100 parameter."""
     out: list[InvoiceLine] = []
@@ -392,6 +430,22 @@ def pull(cn,
         res.window_salids = [i.salid for i in res.rescanned_invoices]
         if res.window_salids:
             res.rescanned_lines = _fetch_lines_for(cur, res.window_salids)
+
+    # ── المسحوبات (dbo.Personal) ───────────────────────────────
+    # الجدول صغير (~117 صف في الداتا) والصفوف ممكن تتحذف أو تتعدل، فمفيش
+    # watermark صالح ليه (اتلاحظت فجوات في Perid نفسها). بنقرا الجدول **كله**
+    # كل دورة — نفس فكرة إعادة مسح الفواتير — عشان أي حذف/تعديل يبان في
+    # دورة واحدة. نفس حارس الـdirty read: صف اتعمله في آخر 30 ثانية
+    # بنسيبه للدورة الجاية (المرجع: نفس حارس الفواتير).
+    cur.execute(
+        "SELECT Perid, peramount, perdate, peruser, PerBRID, pertype, pernote "
+        "FROM dbo.Personal WITH (NOLOCK) "
+        "WHERE perdate < DATEADD(second, -?, GETDATE()) "
+        "ORDER BY Perid",
+        DIRTY_READ_GUARD_SECONDS,
+    )
+    for r in cur.fetchall():
+        res.withdrawals.append(_row_to_withdrawal(r))
 
     # ── الخزينة ───────────────────────────────────────────────
     cur.execute(

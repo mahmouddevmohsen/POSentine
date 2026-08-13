@@ -156,12 +156,24 @@ class Cash:
 
 
 @dataclass(slots=True)
+class Withdrawal:
+    perid: int
+    perdate: _dt.datetime                  # naive, POS local
+    amount: float
+    user_uid: int | None
+    branch_id: int | None
+    per_type: int | None
+    note: str | None
+
+
+@dataclass(slots=True)
 class DBState:
     existing_reports: set[tuple[_dt.date, str]]   # (shift_date, shift_name)
     sent_alerts_today: int
     invoices: list[Inv]                            # last 8 days, deleted included
     lines: list[Line]                              # matching lines
     cash_counts: list[Cash]                        # last 8 days
+    withdrawals: list[Withdrawal]                 # مسحوبات (dbo.Personal)
     users: dict[int, str]
     modifiers: dict[int, bool]
     first_sync_at: _dt.datetime | None             # earliest heartbeat, aware
@@ -361,6 +373,39 @@ def _first_sync_local(state: DBState,
     return state.first_sync_at.astimezone(tz).replace(tzinfo=None)
 
 
+def _longest_gap_bounds(
+    heartbeats: Sequence[_dt.datetime],
+    window_start: _dt.datetime, window_end: _dt.datetime,
+    tz: zoneinfo.ZoneInfo,
+    pad_minutes: int = COVERAGE_GAP_PAD_MINUTES,
+) -> tuple[_dt.datetime, _dt.datetime] | None:
+    """
+    H3/H9: (start, end) UTC of the longest inter-heartbeat silence inside
+    the shift window (padded a few minutes each side to catch a gap
+    straddling a boundary). None = too few heartbeats to judge.
+
+    Heartbeats fire on a fixed schedule regardless of sales activity, so a
+    gap means the agent or the machine was down — never that the shop was
+    quiet. This is the same signal _max_heartbeat_gap_minutes uses; the
+    bounds (not just the length) are what H9's interpretation needs to
+    decide whether the gap is explainable (Sleep-style) or a genuine
+    coverage hole.
+    """
+    pad = _dt.timedelta(minutes=pad_minutes)
+    start_utc = (window_start.replace(tzinfo=tz)
+                 .astimezone(_dt.timezone.utc)) - pad
+    end_utc = (window_end.replace(tzinfo=tz)
+               .astimezone(_dt.timezone.utc)) + pad
+    in_window = sorted(h for h in heartbeats if start_utc <= h <= end_utc)
+    if len(in_window) < 2:
+        return None
+    pairs = list(zip(in_window, in_window[1:]))
+    # max() returns the first maximal pair on a tie — same deterministic
+    # result as max() over the raw timedeltas.
+    a, b = max(pairs, key=lambda p: p[1] - p[0])
+    return a, b
+
+
 def _max_heartbeat_gap_minutes(
     heartbeats: Sequence[_dt.datetime],
     window_start: _dt.datetime, window_end: _dt.datetime,
@@ -378,16 +423,71 @@ def _max_heartbeat_gap_minutes(
     and agent liveness are independent axes, and only the second is what
     "coverage" actually means.
     """
-    pad = _dt.timedelta(minutes=pad_minutes)
-    start_utc = (window_start.replace(tzinfo=tz)
-                 .astimezone(_dt.timezone.utc)) - pad
-    end_utc = (window_end.replace(tzinfo=tz)
-               .astimezone(_dt.timezone.utc)) + pad
-    in_window = sorted(h for h in heartbeats if start_utc <= h <= end_utc)
-    if len(in_window) < 2:
+    bounds = _longest_gap_bounds(heartbeats, window_start, window_end,
+                                 tz, pad_minutes)
+    if bounds is None:
         return None
-    longest = max((b - a) for a, b in zip(in_window, in_window[1:]))
-    return longest.total_seconds() / 60.0
+    return (bounds[1] - bounds[0]).total_seconds() / 60.0
+
+
+def classify_coverage_gap(
+    state: DBState,
+    win_invs: Sequence[Inv],
+    window_start: _dt.datetime, window_end: _dt.datetime,
+    tz: zoneinfo.ZoneInfo,
+    bounds: tuple[_dt.datetime, _dt.datetime] | None = None,
+) -> str:
+    """
+    H9 (2026-08-13) — how the report should read a monitoring gap:
+        'none'        no gap at all.
+        'explained'   monitoring gap ONLY, business data complete — the
+                      shift renders "🟢 الوردية مكتملة" and the report
+                      explains the interruption (machine Sleep).
+        'incomplete'  a real gap that hides possibly-missing business data
+                      — STATUS_INCOMPLETE stays (never weakened).
+
+    'explained' requires ALL of these (an honest proof, never a guess):
+      1) the shift has real business data (win_invs non-empty);
+      2) monitoring resumed: the latest heartbeat is after the gap end;
+      3) the catch-up rescan completed after the gap end — so any POS
+         activity inside the gap would already be in our data ("data
+         recovered" is only claimed when it is provable);
+      4) no business-data integrity problem: not restore_suspected, and
+         no deleted invoice inside the shift window;
+      5) the machine was off during the gap: NO invoice was sold inside
+         the gap window. This is the fingerprint that the interruption
+         was the computer being asleep/unavailable — not an agent/network
+         outage while the shop kept running (in which case we cannot
+         attest the cause and stay conservative: 'incomplete').
+
+    Anything short of that keeps the gap unexplained — the existing
+    STATUS_INCOMPLETE protection is never suppressed to make a report
+    green.
+    """
+    if bounds is None:
+        return "none"
+    gap_start, gap_end = bounds
+    if not win_invs:
+        return "incomplete"
+    if state.heartbeat_at is None or state.heartbeat_at <= gap_end:
+        return "incomplete"          # monitoring never demonstrably resumed
+    if state.last_rescan_at is None or state.last_rescan_at < gap_end:
+        return "incomplete"          # catch-up not done — data may be pending
+    if state.restore_suspected:
+        return "incomplete"          # POS may have been restored to an old state
+    if any(i.deleted_at is not None and window_start <= i.sold_at < window_end
+           for i in state.invoices):
+        return "incomplete"          # demonstrably missing business data
+    # The gap bounds already carry the ±pad_minutes margin from
+    # _longest_gap_bounds, so the sleep-fingerprint below is slightly
+    # CONSERVATIVE on purpose: an invoice sold in the 10-minute pad right
+    # before/after the silence counts as "the shop ran during the gap" and
+    # forces 'incomplete'. Safe direction — never a false "complete".
+    gs = gap_start.astimezone(tz).replace(tzinfo=None)   # POS-local gap window
+    ge = gap_end.astimezone(tz).replace(tzinfo=None)
+    if any(gs <= i.sold_at < ge for i in win_invs):
+        return "incomplete"          # shop ran during the gap — not a sleep
+    return "explained"
 
 
 def heartbeat_gap_stats(
@@ -523,6 +623,17 @@ def _detect_events(now_utc: _dt.datetime, ctx: TenantContext, state: DBState,
     return detected, to_send, overflow, cash_events
 
 
+def _sum_withdrawals(withdrawals: Sequence[Withdrawal],
+                     start: _dt.datetime, end: _dt.datetime) -> float:
+    """مسحوبات نافذة = مجموع peramount لصفوف Personal جوه [start, end).
+
+    نقية وقابلة للاختبار — نفس حدود الوردية اللي بتفلتر بيها الفواتير
+    (بداية شاملة / نهاية غير شاملة).
+    """
+    return round(sum(w.amount for w in withdrawals
+                     if start <= w.perdate < end), 2)
+
+
 def _event_row(ev: E.Event, ctx: TenantContext, status: str) -> dict:
     return {
         "tenant_id": ctx.tenant_id,
@@ -549,21 +660,30 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
     win_invs = [i for i in state.invoices
                 if i.deleted_at is None and start <= i.sold_at < end]
     win_ids = {i.salid for i in win_invs}
+
+    # مسحوبات الوردية = SUM(Personal.peramount) جوه النافذة — نفس حدود
+    # الوردية بالضبط (بداية شاملة / نهاية غير شاملة). المستخدم/الفرع/النوع
+    # بيترسبوا كـ metadata على الصفوف نفسها، لكن التجميع بالنافذة مش بالكاشير
+    # (ممنوع حرق أسماء الكاشير في الحساب، و ممنوع الحساب المزدوج).
+    withdrawals = _sum_withdrawals(state.withdrawals, start, end)
+
     m = M.compute_shift(
         shift_date, shift_name, win_invs,
         lines_by_salid=_lines_for(state.lines, win_ids),
         user_names=state.users,
         product_is_modifier=state.modifiers,
-        top_n=5)
+        top_n=5, withdrawals=withdrawals)
 
     pw_date = M.previous_week_shift(shift_date)
     pw_start, pw_end = M.shift_window(pw_date, shift_name)
     pw_invs = [i for i in state.invoices
                if i.deleted_at is None and pw_start <= i.sold_at < pw_end]
+    pw_withdrawals = _sum_withdrawals(state.withdrawals, pw_start, pw_end)
     prev_total: float | None = None
     prev_count: int | None = None
     if pw_invs:
-        pw = M.compute_shift(pw_date, shift_name, pw_invs)
+        pw = M.compute_shift(pw_date, shift_name, pw_invs,
+                             withdrawals=pw_withdrawals)
         prev_total, prev_count = pw.grand_total, pw.total_invoices
     comparison = M.compare_to_last_week(m.grand_total, prev_total, prev_count)
 
@@ -598,9 +718,21 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
     # general partial-coverage false-green (Limitation 1 of the audit).
     # Only meaningful for reported (non-partial) shifts; a quiet shift
     # heartbeats normally, so this never flags quietness.
-    gap_minutes = _max_heartbeat_gap_minutes(state.heartbeats, start, end, tz)
+    #
+    # H9 (2026-08-13) — how the report READS that gap. The gap is still
+    # detected exactly as before (nothing weakened); the report only
+    # interprets it: when the interruption is explainable (machine Sleep /
+    # off, monitoring resumed, catch-up done, no POS activity inside the
+    # gap, no integrity problem), the shift renders "🟢 الوردية مكتملة"
+    # with the Sleep explanation in the conclusion. Any other gap keeps
+    # STATUS_INCOMPLETE.
+    gap_bounds = _longest_gap_bounds(state.heartbeats, start, end, tz)
+    gap_minutes = ((gap_bounds[1] - gap_bounds[0]).total_seconds() / 60.0
+                   if gap_bounds is not None else None)
     has_coverage_gap = (not is_partial and gap_minutes is not None
                         and gap_minutes >= COVERAGE_GAP_MINUTES)
+    gap_explained = bool(has_coverage_gap and classify_coverage_gap(
+        state, win_invs, start, end, tz, gap_bounds) == "explained")
 
     cash_diffs = sorted((e for e in cash_events if e.type == "cash_diff"
                          and start <= e.occurred_at < end),
@@ -619,7 +751,9 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
     body = R.build_shift_report(m, comparison, notes=notes,
                                 cash_event=cash_event, had_no_count=had_no_count,
                                 max_notes=MAX_REPORT_NOTES,
-                                has_coverage_gap=has_coverage_gap)
+                                has_coverage_gap=has_coverage_gap,
+                                gap_explained=gap_explained,
+                                withdrawals=m.withdrawals)
     E.assert_no_accusation(body)
 
     out.shift_row = {
@@ -634,6 +768,7 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
         "returns": m.returns,
         "delivery": m.delivery,
         "collections": m.collections,
+        "withdrawals": m.withdrawals,
         "grand_total": m.grand_total,
         "n_cash": m.n_cash,
         "n_return": m.n_return,
@@ -972,6 +1107,14 @@ def _load_state(client: supa.Supa, ctx: TenantContext,
         "select": "srid,counted_at,user_uid,user_value,app_value,kind"})
     cash = [_row_cash(r) for r in cash_rows]
 
+    # مسحوبات (dbo.Personal) — المصدر المؤكد لـ"مسحوبات" يومية الخزينة.
+    # نفس نافذة الفواتير (8 أيام) — مفيش فايدة نقرا أبعد من اللي ممكن
+    # يتحول لتقرير أصلاً، وقياس الحجم على الـmigration: ~117 صف/شهر.
+    wd_rows = client.select("withdrawals", {
+        **scope, "perdate": f"gte.{cutoff8}",
+        "select": "perid,perdate,peramount,peruser,perbr_id,pertype,pernote"})
+    withdrawals = [_row_withdrawal(r) for r in wd_rows]
+
     users = {int(r["uid"]): r.get("name") for r in client.select(
         "pos_users", {**scope, "select": "uid,name"}) if r.get("uid") is not None}
     modifiers = {int(r["itid"]): bool(r.get("is_modifier", False))
@@ -1035,6 +1178,7 @@ def _load_state(client: supa.Supa, ctx: TenantContext,
         invoices=invoices_list,
         lines=lines,
         cash_counts=cash,
+        withdrawals=withdrawals,
         users=users,
         modifiers=modifiers,
         first_sync_at=_parse_dt(beats_first[0]["at"]) if beats_first else None,
@@ -1087,6 +1231,19 @@ def _row_cash(r: dict) -> Cash:
                 user_value=float(r.get("user_value") or 0),
                 app_value=float(r.get("app_value") or 0),
                 kind=r.get("kind") or "no_count")
+
+
+def _row_withdrawal(r: dict) -> Withdrawal:
+    return Withdrawal(perid=int(r["perid"]),
+                      perdate=_dt.datetime.fromisoformat(r["perdate"]),
+                      amount=float(r.get("peramount") or 0),
+                      user_uid=(int(r["peruser"]) if r.get("peruser") is not None
+                                else None),
+                      branch_id=(int(r["perbr_id"]) if r.get("perbr_id") is not None
+                                 else None),
+                      per_type=(int(r["pertype"]) if r.get("pertype") is not None
+                                else None),
+                      note=r.get("pernote"))
 
 
 def _outbox_row(e: Envelope, tenant_id: str) -> dict:
@@ -1221,7 +1378,8 @@ def _print_plan(out: Plan, gap_stats: dict | None = None,
     if out.shift_row is not None:
         sr = out.shift_row
         print(f"  shift report    {sr['shift_date']} {sr['shift_name']} "
-              f"grand_total={sr['grand_total']} is_partial={sr['is_partial']}")
+              f"grand_total={sr['grand_total']} withdrawals={sr['withdrawals']} "
+              f"is_partial={sr['is_partial']}")
     for e in out.envelopes:
         print("-" * 62)
         print(f"  [{e.kind}] recipient={e.recipient} dedup={e.dedup_key}")

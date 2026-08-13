@@ -22,8 +22,8 @@ import datetime as _dt
 
 from adapter_hdsoft import (AGENT_VERSION, AdapterError, CashCount,  # noqa: F401
                             Invoice, InvoiceLine, PullResult, RestoreSuspected,
-                            SchemaDrift, classify_cash_count, classify_invoice,
-                            clock_drift_seconds)
+                            SchemaDrift, Withdrawal, classify_cash_count,
+                            classify_invoice, clock_drift_seconds)
 
 # Real names from a public menu. Prices are plausible, not exported.
 MENU = [
@@ -188,6 +188,17 @@ def pull(cn, watermark_salid: int, rescan_from_salid: int,
         res.rescanned_invoices = list(invoices)
         res.window_salids = [i.salid for i in invoices]
         res.rescanned_lines = list(lines)
+
+    # مسحوبات — قيم صغيرة مش حقيقية (fixture مش قبول). واحد صباح واحد مساء
+    # عشان نافذتي الورديتين يتغطوا في الاختبارات.
+    res.withdrawals = [
+        Withdrawal(perid=1, amount=50.0,
+                   perdate=_dt.datetime.combine(BASE_DAY, _dt.time(8, 30)),
+                   user_uid=2, branch_id=0, per_type=0, note="عيش"),
+        Withdrawal(perid=2, amount=100.0,
+                   perdate=_dt.datetime.combine(BASE_DAY, _dt.time(20, 15)),
+                   user_uid=1, branch_id=0, per_type=0, note="مصاريف"),
+    ]
 
     res.cash_counts = [
         CashCount(srid=1, counted_at=_dt.datetime.combine(BASE_DAY, _dt.time(19, 5)),

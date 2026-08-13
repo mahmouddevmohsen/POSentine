@@ -137,6 +137,31 @@ def cash_payload(count, tenant_id: str, source_id: str) -> dict[str, Any]:
     }
 
 
+def withdrawal_payload(w, tenant_id: str, source_id: str) -> dict[str, Any]:
+    """مسحوبات — صف واحد من dbo.Personal مرّ من الـadapter.
+
+    perdate is POS local wall time (pos_ts), never converted — the shift
+    boundary is wall-clock, so a converted timestamp would land the
+    withdrawal in the wrong shift with nobody reporting an error.
+
+    peruser/perbr_id/pertype/pernote ride along as evidence. The
+    aggregation keys on the SHIFT WINDOW, never on the user — the store
+    owner's daybook (يومية الخزينة) subtracts SUM(Personal.peramount)
+    per shift regardless of which cashier took the money out.
+    """
+    return {
+        "tenant_id": tenant_id,
+        "source_id": source_id,
+        "perid": int(w.perid),
+        "perdate": pos_ts(w.perdate),
+        "peramount": _f(w.amount),
+        "peruser": _i(w.user_uid),
+        "perbr_id": _i(w.branch_id),
+        "pertype": _i(w.per_type),
+        "pernote": w.note,
+    }
+
+
 def product_payload(product: Mapping[str, Any], tenant_id: str,
                     source_id: str) -> dict[str, Any]:
     """is_modifier is GENERATED ALWAYS AS (...) STORED — never sent."""

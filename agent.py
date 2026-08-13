@@ -404,6 +404,7 @@ class CycleResult:
     invoices: list[dict[str, Any]] = field(default_factory=list)
     lines: list[dict[str, Any]] = field(default_factory=list)
     cash: list[dict[str, Any]] = field(default_factory=list)
+    withdrawals: list[dict[str, Any]] = field(default_factory=list)
     products: list[dict[str, Any]] = field(default_factory=list)
     users: list[dict[str, Any]] = field(default_factory=list)
     anomalies: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
@@ -520,6 +521,14 @@ def build_cycle(adapter, cn, cfg: Config, state: State,
     result.cash = [R.cash_payload(c, cfg.tenant_id, cfg.source_id)
                    for c in pulled.cash_counts]
 
+    # مسحوبات — نفس النموذج: PullResult → payloads جاهزة للرفع.
+    # التجميع بالوردية بيحصل في الـorchestrator (cloud-side) من نفس القيم
+    # دي؛ الأجينت بيمررها زي ما هي.
+    result.withdrawals = [
+        R.withdrawal_payload(w, cfg.tenant_id, cfg.source_id)
+        for w in pulled.withdrawals
+    ]
+
     if pulled.unknown_sal_t:
         for sal_t in sorted(set(pulled.unknown_sal_t)):
             result.anomalies.append(("unknown_sal_t", {"sal_t": sal_t}))
@@ -549,7 +558,8 @@ def upload(client: supa.Supa, cfg: Config, result: CycleResult) -> None:
             ("pos_users", result.users, "tenant_id,source_id,uid"),
             ("invoices", result.invoices, "tenant_id,source_id,salid"),
             ("invoice_lines", result.lines, "tenant_id,source_id,saledeid"),
-            ("cash_counts", result.cash, "tenant_id,source_id,srid")):
+            ("cash_counts", result.cash, "tenant_id,source_id,srid"),
+            ("withdrawals", result.withdrawals, "tenant_id,source_id,perid")):
         if not payload:
             continue
         try:
@@ -559,7 +569,43 @@ def upload(client: supa.Supa, cfg: Config, result: CycleResult) -> None:
                       table, len(payload), ", ".join(landed) or "nothing")
             raise
         landed.append(f"{table}={len(payload)}")
+    _mirror_withdrawal_deletions(client, cfg, result)
     LOG.info("upload ok  %s", "  ".join(landed) or "nothing to upload")
+
+
+def _mirror_withdrawal_deletions(client: supa.Supa, cfg: Config,
+                                 result: CycleResult) -> None:
+    """
+    dbo.Personal بيتقرا **كله** كل دورة (جدول صغير) — فسحاب withdrawals
+    لازم يبقى مرآة حرفية للي موجود عندهم دلوقتي.
+
+    perid موجود على السحاب ومش موجود في آخر لقطة = اتمسح من الـPOS.
+    لازم نمسحه هنا، وإلا مسحوب اتمسح هيستمّر مخصوم من كل يومية بعدها
+    للأبد. نفس فلسفة إعادة مسح الفواتير: الغياب هو الإشارة.
+
+    Idempotent: نفس اللقطة → نفس النتيجة، ومفيش watermark (الجدول كله
+    بيتقرا من غير حد). مش أحداث ولا تنبيهات — ده مزامنة.
+
+    ⚠️ حافة مقبولة (موثقة، مش بتتصلح بكود): حارس الـdirty-read بيستثني
+    من اللقطة الصفوف اللي perdate بتاعها أحدث من 30 ثانية. لو صف اتعمل
+    (أو اتحورت قيمته وperdate اتحدث) جوه الـ30 ثانية دول، فهو مش في
+    اللقطة الحالية → المرآة هتمسحه من السحاب، والدورة الجاية هترفعه تاني
+    بالقيمة الصح (self-healing خلال دورة واحدة). perdate في HD Soft هو
+    وقت إنشاء الصف (زي saldate)، فالتعديلات مش بتغيّره — الحافة دي
+    بتتطلب حقل "آخر تعديل" مش موجود، واحتمال حدوثها شبه منعدم.
+    التصحيح الكامل (نافذة استقرار من لقطتين) هيضيف state للأجينت مقابل
+    حافة متقدرش تحصل عملياً — مرفوض.
+    """
+    scope = {"tenant_id": f"eq.{cfg.tenant_id}",
+             "source_id": f"eq.{cfg.source_id}"}
+    current = {int(w["perid"]) for w in result.withdrawals}
+    cloud = client.select("withdrawals", {**scope, "select": "perid"})
+    stale = [int(r["perid"]) for r in cloud
+             if int(r["perid"]) not in current]
+    if stale:
+        client.delete("withdrawals",
+                      {**scope, "perid": f"in.({','.join(map(str, stale))})"})
+        LOG.info("withdrawals: mirrored %d POS deletion(s)", len(stale))
 
 
 def advance_sync_state(client: supa.Supa, cfg: Config, state: State,
@@ -671,6 +717,7 @@ def print_dry_run(result: CycleResult, state: State, driver: str,
     w(f"  invoices to upload   {len(result.invoices)}")
     w(f"  lines to upload      {len(result.lines)}")
     w(f"  cash counts          {len(result.cash)}")
+    w(f"  withdrawals          {len(result.withdrawals)}")
     w(f"  products in snapshot {len(getattr(result, 'products_snapshot', {}))}")
     if sold:
         w(f"  sold_at range        {min(sold)}  ->  {max(sold)}")
@@ -797,7 +844,7 @@ def confirm(client: supa.Supa, cfg: Config, out=None) -> int:
         print(text, file=out)
 
     counts = {name: client.count(name, scope) for name in
-              ("invoices", "invoice_lines", "cash_counts",
+              ("invoices", "invoice_lines", "cash_counts", "withdrawals",
                "pos_products", "pos_users")}
     null_price = client.count("invoice_lines", {**scope, "list_price": "is.null"})
     state_rows = client.select("sync_state", {**scope, "select": "*"})
@@ -904,11 +951,12 @@ def _log_what_was_read(result: CycleResult, state: State) -> None:
     """
     pulled = result.pull
     LOG.info("pull ok    new_invoices=%d new_lines=%d rescan_invoices=%d "
-             "rescan_lines=%d cash=%d products=%d pos_clock=%s pos_max_salid=%d",
+             "rescan_lines=%d cash=%d withdrawals=%d products=%d "
+             "pos_clock=%s pos_max_salid=%d",
              result.new_invoice_count, len(pulled.new_lines),
              len(pulled.rescanned_invoices), len(pulled.rescanned_lines),
-             len(pulled.cash_counts), len(pulled.products),
-             pulled.pos_clock, pulled.max_salid)
+             len(pulled.cash_counts), len(pulled.withdrawals),
+             len(pulled.products), pulled.pos_clock, pulled.max_salid)
 
     held_back = pulled.max_salid - result.watermark_target
     if held_back > 0:

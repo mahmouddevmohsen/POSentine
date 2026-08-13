@@ -116,7 +116,7 @@ not make them.
 ## 1 — Console and Python
 
 ```powershell
-cd C:\thirdeyev
+cd C:\Users\Techno\Downloads\posentine
 chcp 65001
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
@@ -153,7 +153,7 @@ for SQL Server", then retry.
 
 ## 3 — Config and token
 
-Place `config.json` in `C:\thirdeyev`, copied from `config.example.json` and filled in.
+Place `config.json` in `C:\Users\Techno\Downloads\posentine`, copied from `config.example.json` and filled in.
 Never paste a token into a terminal, and never commit this file.
 
 ```powershell
@@ -467,7 +467,7 @@ registered but not working, and nothing will arrive after you leave.
 ## 8 — Before you leave
 
 ```powershell
-Get-Content C:\thirdeyev\agent.log -Tail 20
+Get-Content C:\Users\Techno\Downloads\posentine\agent.log -Tail 20
 ```
 
 Expect `cycle ok` lines and no tracebacks.
@@ -561,7 +561,7 @@ was never written to at any point.
 ## If you get stuck
 
 ```powershell
-Get-Content C:\thirdeyev\agent.log -Tail 100
+Get-Content C:\Users\Techno\Downloads\posentine\agent.log -Tail 100
 ```
 
 Send that, the step number, and the exact message. The log is UTF-8 and contains no

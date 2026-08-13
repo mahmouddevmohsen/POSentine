@@ -23,6 +23,11 @@ REPO = Path(__file__).resolve().parent
 MIGRATIONS = ("schema_v5_outbox_claimed_at.sql",
               "schema_v6_grand_total_check.sql")
 
+# v7 (2026-08-13) is the withdrawals migration: it is the ONE file that may
+# create a table (withdrawals), so it is deliberately kept OUT of the
+# no-create-table guard above and gets its own structural checks below.
+V7 = "schema_v7_withdrawals.sql"
+
 
 def _read(name: str) -> str:
     path = REPO / name
@@ -70,3 +75,55 @@ def test_migrations_never_create_tables_or_touch_schema_sql():
         text = _read(name)
         assert "create table" not in text, f"{name} creates a table"
         assert "alter table recipients" not in text
+
+
+# ════════════════════════════════════════════════════════════════
+# v7 — withdrawals (2026-08-13, closure task)
+# ════════════════════════════════════════════════════════════════
+
+def test_v7_creates_the_withdrawals_table_idempotently():
+    text = _read(V7)
+    assert "create table if not exists withdrawals" in text
+    assert "perid" in text and "peramount" in text and "perdate" in text
+    assert "primary key (tenant_id, source_id, perid)" in text
+    # metadata columns ride along as evidence — the aggregation is by the
+    # shift window, never by the cashier
+    assert "peruser" in text and "perbr_id" in text and "pertype" in text
+
+
+def test_v7_is_additive_and_never_touches_schema_sql_or_recipients():
+    text = _read(V7)
+    assert "alter table recipients" not in text
+    apply_lines = [ln for ln in text.splitlines()
+                   if ln.strip() and not ln.strip().startswith("--")]
+    assert not any("drop table" in ln.lower() for ln in apply_lines)
+    assert "alter table shift_reports" in text
+
+
+def test_v7_adds_shift_reports_withdrawals_column_and_rls():
+    text = _read(V7)
+    assert "add column if not exists withdrawals numeric(12,2)" in text
+    assert "alter table withdrawals enable row level security" in text
+    assert "agent_rw on public.withdrawals" in text
+    # agent policy must carry the same tenant claim as every other table
+    assert "auth.jwt() ->> 'tenant_id'" in text
+
+
+def test_v7_updates_the_grand_total_check_to_include_withdrawals():
+    text = _read(V7)
+    # the old v6 constraint is dropped and re-added with the withdrawals
+    # term — the daybook formula is now sales + collections − returns
+    # − delivery − withdrawals (withdrawals deducted, never added)
+    assert "drop constraint shift_reports_grand_total_formula" in text
+    assert ("check (grand_total = sales + collections - returns - delivery"
+            " - withdrawals)" in text)
+    # a plus-sign variant would double-count a deduction — never allowed
+    assert "+ withdrawals" not in text
+
+
+def test_v7_documents_verification_and_rollback():
+    text = _read(V7)
+    assert "23514" in text                      # the refusal code
+    assert "select tenant_id, source_id, count(*) from withdrawals" in text
+    assert "drop column withdrawals" in text    # documented rollback
+    assert "add constraint shift_reports_grand_total_formula" in text

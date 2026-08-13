@@ -227,7 +227,7 @@ pass for the wrong reason.
 
 The complete list. If it is not here, we do not touch it.
 
-**Our own folder** (wherever the operator copied it, e.g. `C:\thirdeyev`):
+**Our own folder** (wherever the operator copied it, e.g. `C:\Users\Techno\Downloads\posentine`):
 
 | Path | Written by | Removed by `uninstall_agent.ps1 -Purge` |
 |---|---|---|
@@ -322,7 +322,7 @@ Stated plainly, because a boundary we name is worth more than one we imply.
 ## How to check it yourself, on the machine, any time
 
 ```powershell
-cd C:\thirdeyev
+cd C:\Users\Techno\Downloads\posentine
 python preflight.py --skip-install
 ```
 

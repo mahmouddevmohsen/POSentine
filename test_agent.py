@@ -41,20 +41,27 @@ class FakeSupa:
     """Records writes; can be told to fail on one table."""
 
     def __init__(self, fail_on: str | None = None, cloud_watermark: int = 0,
-                 sync_state_rows: list | None = None):
+                 sync_state_rows: list | None = None,
+                 cloud_withdrawal_perids: list[int] | None = None):
         self.fail_on = fail_on
         self.cloud_watermark = cloud_watermark
         self.sync_state_rows = sync_state_rows
+        self.cloud_withdrawal_perids = cloud_withdrawal_perids
         self.upserts: list[tuple[str, int]] = []
         self.updates: list[tuple[str, dict]] = []
         self.update_filters: list[tuple[str, dict]] = []
         self.inserts: list[tuple[str, list]] = []
+        self.deletes: list[tuple[str, dict]] = []
 
     def upsert(self, table, rows, on_conflict):
         if table == self.fail_on:
             raise supa.SupaError(f"{table}: 0 of {len(rows)} rows landed")
         self.upserts.append((table, len(rows)))
         return len(rows)
+
+    def delete(self, table, filters):
+        self.deletes.append((table, dict(filters)))
+        return None
 
     def update(self, table, filters, patch, returning=True):
         if table == self.fail_on:
@@ -68,6 +75,8 @@ class FakeSupa:
         return []
 
     def select(self, table, params=None, paginate=True):
+        if table == "withdrawals" and self.cloud_withdrawal_perids is not None:
+            return [{"perid": p} for p in self.cloud_withdrawal_perids]
         if table != "sync_state":
             return []
         if self.sync_state_rows is not None:
@@ -435,8 +444,8 @@ def test_a_hung_holder_is_taken_over_rather_than_stalling_forever(tmp_path):
 class ReadbackSupa:
     def __init__(self, counts=None, state=None, beats=None):
         self.counts = counts or {"invoices": 45, "invoice_lines": 129,
-                                 "cash_counts": 2, "pos_products": 9,
-                                 "pos_users": 1}
+                                 "cash_counts": 2, "withdrawals": 2,
+                                 "pos_products": 9, "pos_users": 1}
         self.null_price = 0
         self.state = state if state is not None else [{
             "watermark_salid": 1104, "last_sync_at": "2026-08-09T03:00:00+00:00",

@@ -12,12 +12,16 @@ metrics.py — حساب الورديات ويومية الخزينة
 
 المعادلة الحاكمة (متحقق منها بشاشة "يومية الخزينة" — 19,205 = 19,205):
 
-    الإجمالي = مبيعات + مقبوضات − مرتجع − دليفري
+    الإجمالي = مبيعات + مقبوضات − مرتجع − دليفري − مسحوبات
 
-    مبيعات  = مجموع total للفواتير kind='cash'
-    مقبوضات = مجموع total للفواتير kind='external'
-    مرتجع   = مجموع total للفواتير kind='return'
-    دليفري  = مجموع delivery_cost لكل الفواتير
+    مبيعات   = مجموع total للفواتير kind='cash'
+    مقبوضات  = مجموع total للفواتير kind='external'
+    مرتجع    = مجموع total للفواتير kind='return'
+    دليفري   = مجموع delivery_cost لكل الفواتير
+    مسحوبات  = مجموع peramount من dbo.Personal جوه نافذة الوردية
+
+⚠️ مسحوبات بيتمرّر كقيمة محسوبة من المتصل (الـorchestrator بيفلتر
+   dbo.Personal بالنافذة) — الدالة هنا بتحسب المعادلة بس، وتبقى نقية.
 ================================================================
 """
 
@@ -113,6 +117,7 @@ class ShiftMetrics:
     returns: float = 0.0
     delivery: float = 0.0
     collections: float = 0.0
+    withdrawals: float = 0.0
     grand_total: float = 0.0
 
     n_cash: int = 0
@@ -143,6 +148,7 @@ def compute_shift(
     user_names: dict[int, str] | None = None,
     product_is_modifier: dict[int, bool] | None = None,
     top_n: int = 5,
+    withdrawals: float = 0.0,    # مجموع peramount لصفوف Personal جوه النافذة
 ) -> ShiftMetrics:
     """
     بيحسب وردية واحدة من فواتيرها.
@@ -181,10 +187,13 @@ def compute_shift(
         per_user_n[uid] += 1
         per_user_amt[uid] += total
 
-    # 🎯 المعادلة المتحقق منها
-    m.grand_total = m.sales + m.collections - m.returns - m.delivery
+    # 🎯 المعادلة المتحقق منها — المسحوبات بتتخصم (اليومية بتخصمها)
+    m.withdrawals = withdrawals
+    m.grand_total = (m.sales + m.collections - m.returns - m.delivery
+                     - m.withdrawals)
 
-    for f in ("sales", "returns", "delivery", "collections", "grand_total"):
+    for f in ("sales", "returns", "delivery", "collections",
+              "withdrawals", "grand_total"):
         setattr(m, f, _round2(getattr(m, f)))
 
     m.total_invoices = sum(per_user_n.values())

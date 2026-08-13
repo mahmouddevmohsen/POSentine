@@ -31,8 +31,8 @@ REPO = Path(__file__).resolve().parent
 CAIRO = "Africa/Cairo"
 
 
-def t(y, mo, d, h, mi=0):
-    return _dt.datetime(y, mo, d, h, mi)          # naive POS local
+def t(y, mo, d, h, mi=0, s=0):
+    return _dt.datetime(y, mo, d, h, mi, s)       # naive POS local
 
 
 def utc(y, mo, d, h, mi=0):
@@ -83,17 +83,18 @@ def ctx(go_live=None, recipients=None, alert_settings=None,
         alert_settings=alert_settings if alert_settings is not None else settings())
 
 
-def state(existing=(), sent=0, invoices=(), lines=(), cash=(), users=None,
-          modifiers=None, first_sync=None, heartbeat=None, last_rescan=None,
-          rescan_from=0, month_invoices=(), month_lines=(), mirrored=(),
-          failure=(), open_kinds=(), restore=False, schema_ok=True,
-          heartbeats=(), open_gaps=(), sent_monthly=()):
+def state(existing=(), sent=0, invoices=(), lines=(), cash=(),
+          withdrawals=(), users=None, modifiers=None, first_sync=None,
+          heartbeat=None, last_rescan=None, rescan_from=0, month_invoices=(),
+          month_lines=(), mirrored=(), failure=(), open_kinds=(), restore=False,
+          schema_ok=True, heartbeats=(), open_gaps=(), sent_monthly=()):
     return orchestrator.DBState(
         existing_reports=set(existing),
         sent_alerts_today=sent,
         invoices=list(invoices),
         lines=list(lines),
         cash_counts=list(cash),
+        withdrawals=list(withdrawals),
         users=users if users is not None else {1: "أحمد"},
         modifiers=modifiers if modifiers is not None else {},
         first_sync_at=first_sync,
@@ -110,6 +111,13 @@ def state(existing=(), sent=0, invoices=(), lines=(), cash=(), users=None,
         heartbeats=list(heartbeats),
         open_aged_gap_keys=set(open_gaps),
         sent_monthly_keys=set(sent_monthly))
+
+
+def wdl(perid, perdate, amount=50.0, user=2, branch=0, per_type=0, note=None):
+    """مسحوبات — دالة بناء زي inv(). التجميع بالنافذة مش بالمستخدم."""
+    return orchestrator.Withdrawal(perid=perid, perdate=perdate, amount=amount,
+                                   user_uid=user, branch_id=branch,
+                                   per_type=per_type, note=note)
 
 
 def line(saledeid, salid, qty=1.0, list_price=50.0, item="طعمية", itid=1):
@@ -227,6 +235,104 @@ def test_shift_envelope_dedup_key_is_exact():
     out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
     shift = next(e for e in out.envelopes if e.kind == "shift_report")
     assert shift.dedup_key == "shift_report:2026-06-30:evening"
+
+
+# ════════════════════════════════════════════════════════════════
+# مسحوبات — SUM(Personal.peramount) جوه النافذة، بتتخصم من الإجمالي
+# ════════════════════════════════════════════════════════════════
+
+def test_shift_row_carries_withdrawals_and_subtracts_them():
+    """grand_total = sales + collections − returns − delivery − withdrawals."""
+    s = state(invoices=[
+        inv(1, t(2026, 6, 30, 20, 0), total=1000.0, kind="cash"),
+        inv(2, t(2026, 6, 30, 21, 0), total=100.0, kind="external"),
+        inv(3, t(2026, 6, 30, 22, 0), total=50.0, kind="return"),
+    ], withdrawals=[
+        wdl(3, t(2026, 6, 30, 20, 30), amount=50.0),
+        wdl(4, t(2026, 6, 30, 23, 0), amount=100.0),
+    ])
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawals"] == 150.0
+    assert out.shift_row["grand_total"] == 1000.0 + 100.0 - 50.0 - 150.0
+
+
+def test_withdrawals_outside_the_shift_window_are_ignored():
+    """نافذة المساء [19:00, 07:00) — مسحوب صباح اليوم التالي برّه النافذة."""
+    s = state(invoices=[inv(1, t(2026, 6, 30, 20, 0))],
+              withdrawals=[wdl(3, t(2026, 7, 1, 6, 0), amount=50.0),
+                           wdl(4, t(2026, 7, 1, 8, 0), amount=60.0)])
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawals"] == 50.0   # 06:00 = لسه المساء
+
+
+def test_withdrawal_boundaries_match_shift_window():
+    """06:59:59 → المساء اللي فات · 07:00:00 → الصباح (نفس حدود الفواتير)."""
+    # مساء 2026-06-30: النافذة [19:00, 07:00) — 06:59:59 يوم 7/1 جواها
+    s = state(invoices=[inv(1, t(2026, 6, 30, 20, 0))],
+              withdrawals=[wdl(1, t(2026, 7, 1, 6, 59, 59), amount=10.0)])
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawals"] == 10.0
+
+    # صباح 2026-07-01: النافذة [07:00, 19:00) — 07:00:00 جواها.
+    # الصباح مش مقفول الساعة 12:00 UTC (15:00 محلي) → لازم force_shift
+    # (نفس ما بيعمله التشغيل اليدوي للتقرير الصباحي).
+    s2 = state(invoices=[inv(1, t(2026, 7, 1, 8, 0))],
+               withdrawals=[wdl(1, t(2026, 7, 1, 7, 0, 0), amount=10.0)])
+    out2 = orchestrator.plan(utc(2026, 7, 1, 12, 0), ctx(), s2,
+                             force_shift="morning",
+                             shift_date=_dt.date(2026, 7, 1))
+    assert out2.shift_row["withdrawals"] == 10.0
+
+
+def test_withdrawal_belongs_to_its_shift_not_its_cashier():
+    """التجميع بالنافذة — peruser بيتبعت metadata بس، ومش بيقسّم الإجمالي."""
+    # وردية مساء 6/30: مسحوبات لمحمود (uid=1) و حمص (uid=2) كلها بتتحسب
+    s = state(invoices=[inv(1, t(2026, 6, 30, 20, 0))],
+              withdrawals=[wdl(1, t(2026, 6, 30, 20, 30), amount=50.0, user=1),
+                           wdl(2, t(2026, 6, 30, 21, 0), amount=100.0, user=2)])
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawals"] == 150.0
+    assert out.shift_row["grand_total"] == 100.0 - 150.0
+
+
+def test_empty_withdrawals_keep_the_verified_formula():
+    """مفيش مسحوبات → نفس المعادلة القديمة المتحقق منها (19,205 الحالة)."""
+    s = state(invoices=[inv(1, t(2026, 6, 30, 20, 0), total=100.0)])
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawals"] == 0.0
+    assert out.shift_row["grand_total"] == 100.0
+
+
+def test_previous_week_comparison_uses_withdrawals_on_both_sides():
+    """المقارنة بنفس الوردية لازم تخصم مسحوبات الأسبوعين — قياس عادل.
+    الأسبوع اللي فات محتاج ≥ 20 فاتورة (MIN_INVOICES_FOR_STATS) عشان
+    المقارنة تتفعل أصلًا."""
+    prev_invs = [inv(100 + i, t(2026, 6, 24, 20 + i // 20, i % 60),
+                     total=25.0, kind="cash") for i in range(20)]
+    s = state(invoices=[
+        inv(1, t(2026, 7, 1, 20, 0), total=1000.0, kind="cash"),
+        *prev_invs,
+    ], withdrawals=[
+        wdl(1, t(2026, 7, 1, 20, 30), amount=100.0),   # الأسبوع الحالي
+        wdl(2, t(2026, 6, 24, 20, 30), amount=50.0),    # الأسبوع اللي فات
+    ])
+    out = orchestrator.plan(utc(2026, 7, 2, 4, 10), ctx(), s)
+    body = _shift_body(out)
+    assert "900 ج" in body           # 1000 - 100
+    assert "450 ج" in body           # 500 - 50
+
+
+def test_pertype_rows_are_summed_without_filtering():
+    """مفيش دليل يستثني pertype=1 — الأأمن نضيف كل الصفوف (المالك أكد
+    SUM(Personal.peramount) من غير فلتر).
+    """
+    s = state(invoices=[inv(1, t(2026, 6, 30, 20, 0))],
+              withdrawals=[wdl(1, t(2026, 6, 30, 20, 30), amount=50.0,
+                               per_type=0),
+                           wdl(2, t(2026, 6, 30, 21, 0), amount=50.0,
+                               per_type=1)])
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawals"] == 100.0
 
 
 def test_partial_first_shift_is_recorded_but_never_reported():
@@ -784,6 +890,87 @@ def _max_gap(beats, win_start, win_end):
         _zi.ZoneInfo(CAIRO))
     assert gap is not None
     return gap
+
+
+# ════════════════════════════════════════════════════════════════
+# H9 — interpreting a monitoring gap (Sleep-style, 2026-08-13)
+# ════════════════════════════════════════════════════════════════
+# Same evening shift: 19:00→07:00 local = 16:00Z→04:00Z. The gap detection
+# is untouched (H3); H9 only decides how the REPORT reads a detected gap.
+# A gap is 'explained' (report says complete + Sleep explanation) only when
+# the machine was demonstrably off during it — otherwise STATUS_INCOMPLETE
+# stays.
+
+def _sleep_gap_state():
+    """Machine asleep 21:00–22:00 local (18:00–19:00Z): no sales inside
+    the gap, monitoring resumed after, catch-up rescan already done."""
+    beats = [b for b in _cadence_beats()
+             if not (utc(2026, 6, 30, 18, 0) <= b < utc(2026, 6, 30, 19, 0))]
+    invs = [inv(1, t(2026, 6, 30, 20, 30)),      # 17:30Z — before the gap
+            inv(2, t(2026, 6, 30, 22, 30))]      # 19:30Z — after the gap
+    return state(invoices=invs, heartbeats=beats,
+                 heartbeat=utc(2026, 7, 1, 4, 0),        # monitoring resumed
+                 last_rescan=utc(2026, 7, 1, 3, 0))      # catch-up complete
+
+
+def test_sleep_gap_shift_is_reported_complete_with_explanation():
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), _sleep_gap_state())
+    body = _shift_body(out)
+    assert R.STATUS_STABLE in body                    # 🟢 الوردية مكتملة
+    assert R.STATUS_INCOMPLETE not in body
+    assert "وضع Sleep" in body
+    assert "تم استئناف المراقبة بعد عودة الجهاز للعمل" in body
+    assert "الوردية مكتملة وتم تسجيل بياناتها" in body
+
+
+def test_gap_with_sales_inside_it_is_never_explained():
+    # an invoice sold during the gap proves the shop was RUNNING while the
+    # agent was down — the cause is not Sleep and coverage was partial
+    s = _sleep_gap_state()
+    s.invoices.append(inv(3, t(2026, 6, 30, 21, 30)))    # 18:30Z, inside gap
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert R.STATUS_INCOMPLETE in _shift_body(out)
+
+
+def test_gap_before_catchup_rescan_is_never_explained():
+    # the agent resumed but has not re-read the POS past the gap — any
+    # business data from the gap may still be pending, so "complete" is
+    # not provable
+    s = _sleep_gap_state()
+    s.last_rescan_at = utc(2026, 6, 30, 18, 30)        # before the gap end
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert R.STATUS_INCOMPLETE in _shift_body(out)
+
+
+def test_gap_while_agent_still_down_is_never_explained():
+    # monitoring never demonstrably resumed after the gap
+    s = _sleep_gap_state()
+    s.heartbeat_at = utc(2026, 6, 30, 18, 30)          # still down at gap end
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert R.STATUS_INCOMPLETE in _shift_body(out)
+
+
+def test_restore_suspected_never_explains_a_gap():
+    s = _sleep_gap_state()
+    s.restore_suspected = True
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert R.STATUS_INCOMPLETE in _shift_body(out)
+
+
+def test_deleted_invoice_in_window_never_explains_a_gap():
+    s = _sleep_gap_state()
+    s.invoices.append(inv(9, t(2026, 6, 30, 22, 0),
+                         deleted=utc(2026, 7, 1, 0, 0)))
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert R.STATUS_INCOMPLETE in _shift_body(out)
+
+
+def test_classify_coverage_gap_none_without_bounds():
+    import zoneinfo as _zi
+    s = _sleep_gap_state()
+    assert orchestrator.classify_coverage_gap(
+        s, [], t(2026, 6, 30, 19, 0), t(2026, 7, 1, 7, 0),
+        _zi.ZoneInfo(CAIRO)) == "none"
 
 
 # ════════════════════════════════════════════════════════════════

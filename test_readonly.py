@@ -379,7 +379,13 @@ class Cloud:
     def upsert(self, t, rows, on_conflict): return len(rows)
     def update(self, t, f, p, returning=True): return [p]
     def insert(self, t, rows, returning=True): return []
+    def delete(self, t, filters): pass
     def select(self, t, params=None, paginate=True):
+        # withdrawals: nothing in the cloud — the mirror has nothing to
+        # delete. Every other table answers the sync_state shape, which is
+        # the only shape this probe's run_once path reads.
+        if t == "withdrawals":
+            return []
         return [{"watermark_salid": 1000, "rescan_from_salid": 1000}]
     def count(self, t, params=None): return 0
 
