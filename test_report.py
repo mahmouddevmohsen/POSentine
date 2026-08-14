@@ -344,12 +344,16 @@ def test_pick_status_explained_gap_returns_complete():
                          gap_explained=True) == R.STATUS_CASH
 
 
-def test_mahmoud_is_shown_as_a_breakdown_of_sales():
+def test_primary_user_alone_gets_no_user_section():
+    # CASE A — وردية فيها المستخدم الأساسي بس: مفيش أي قسم مستخدم
+    # (ممنوع سطر "منها" أو سطر موظف لمجرد إن الوردية ليها مستخدم).
     m = _mahmoud_shift()
     text = R.build_shift_report(m, _NO_COMPARISON)
-    assert "👥 محمود — 24 فاتورة (1,630 ج) خلال الوردية" in text
-    assert "↳ منها محمود" in text
-    assert "+1,630" in text
+    assert "👤 نشاط مستخدم آخر" not in text
+    assert "👥" not in text
+    assert "خلال الوردية" not in text
+    assert "↳ منها" not in text
+    assert "+1,630" not in text
 
 
 def test_mahmoud_breakdown_does_not_change_the_total():
@@ -455,29 +459,118 @@ def test_fewer_than_five_items_still_renders():
     assert "5️⃣" not in text
 
 
-def test_employee_line_prefers_other_cashiers_else_primary():
-    # real-data shape: the branch account is the primary user (shown in the
-    # header) and the cashier is an other user — the employee line and the
-    # breakdown still lead with the cashier (محمود), dynamically, never
-    # hard-coded.
+def test_other_user_activity_shows_separate_section():
+    # CASE B — مستخدم تاني اشتغل أثناء الوردية: القسم بيظهر منفصل قبل
+    # بنود اليومية (مش تحتها)، ومفيش "↳ منها" تحت المبيعات. المثال
+    # المعتمد: هيدر "حمص" (الأساسي) + قسم "محمود" (مستخدم تاني).
     m = _mahmoud_shift()
     m.primary_user = M.UserSlice(uid=2, name="حمص", invoices=238,
                                  amount=15950.0)
     m.other_users = [M.UserSlice(uid=1, name="محمود", invoices=24,
                                  amount=1630.0)]
     text = R.build_shift_report(m, _NO_COMPARISON)
-    assert "👥 محمود — 24 فاتورة (1,630 ج) خلال الوردية" in text
-    assert "↳ منها محمود     +1,630 ج" in text
-    assert "19,285" in text                 # still the same total
+    assert "👤 نشاط مستخدم آخر" in text
+    assert "محمود — 24 فاتورة — 1,630 ج" in text
+    assert text.index("👤 نشاط مستخدم آخر") < text.index("مبيعات")
+    assert "↳ منها" not in text
+    assert "19,285" in text                 # الإجمالي زي ما هو
 
 
 def test_no_employee_line_when_no_valid_user_amount():
     # a shift with no primary user and no other users (thin / unknown) must
-    # not invent an employee line or a breakdown
+    # not invent a user section or a breakdown
     m = _shift(total_invoices=25, n_cash=25, sales=1000.0, grand_total=1000.0)
     text = R.build_shift_report(m, _NO_COMPARISON)
     assert "خلال الوردية" not in text
     assert "↳ منها" not in text
+    assert "👤 نشاط مستخدم آخر" not in text
+
+
+# ════════════════════════════════════════════════════════════════
+# نشاط مستخدم آخر — القاعدة المعتمدة (2026-08-14)
+# ════════════════════════════════════════════════════════════════
+# الفصل بين إجماليات الوردية ونشاط المستخدمين:
+#   CASE A — مفيش نشاط لمستخدم غير الأساسي: مفيش قسم مستخدم خالص.
+#   CASE B — مستخدم تاني اشتغل: قسم منفصل قبل البنود، عرض فقط.
+# ممنوع "منها X" (ادعاء رياضي غير مضمون) وممنوع أي إضافة على الإجمالي.
+
+def test_task_example_ham_shift_mahmoud_4_invoices_155():
+    # مثال المهمة بالحرف: وردية حمص + محمود 4 فواتير بـ155 ج.
+    m = M.ShiftMetrics(
+        shift_date=_dt.date(2026, 8, 12), shift_name="morning",
+        window_start=_dt.datetime(2026, 8, 12, 7, 0),
+        window_end=_dt.datetime(2026, 8, 12, 19, 0),
+        sales=17465.0, returns=0.0, delivery=0.0, collections=0.0,
+        grand_total=17465.0,
+        n_cash=267, n_return=0, n_external=0,
+        total_invoices=267,
+        primary_user=M.UserSlice(uid=2, name="حمص", invoices=263,
+                                 amount=17310.0),
+        other_users=[M.UserSlice(uid=1, name="محمود", invoices=4,
+                                 amount=155.0)],
+    )
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    assert "👤 نشاط مستخدم آخر" in text
+    assert "محمود — 4 فواتير — 155 ج" in text
+    assert "↳ منها محمود" not in text
+
+
+def test_user_activity_not_added_to_grand_total():
+    # TEST 4 — مبلغ المستخدم مش بيتضاف على الإجمالي: القسم عرض فقط.
+    m = _mahmoud_shift()
+    m.primary_user = M.UserSlice(uid=2, name="حمص", invoices=238,
+                                 amount=15950.0)
+    m.other_users = [M.UserSlice(uid=1, name="محمود", invoices=4,
+                                 amount=155.0)]
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    assert "19,285" in text
+    assert "19,440" not in text          # 19,285 + 155 — حساب مزدوج
+    assert "155 ج" in text               # بس كسطر عرض في قسم المستخدم
+
+
+def test_user_amount_larger_than_sales_never_claims_menha():
+    # TEST 5 — مبلغ المستخدم أكبر من مبيعات الوردية: ممنوع "منها" نهائياً.
+    m = _mahmoud_shift()
+    m.primary_user = M.UserSlice(uid=2, name="حمص", invoices=10,
+                                 amount=100.0)
+    m.other_users = [M.UserSlice(uid=1, name="محمود", invoices=30,
+                                 amount=5000.0)]
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    assert "👤 نشاط مستخدم آخر" in text
+    assert "منها" not in text
+
+
+def test_financial_lines_unchanged_without_cross_user_activity():
+    # TEST 6 — وردية عادية من غير تدخّل مستخدم تاني: البنود والإجمالي زي
+    # ما هما بالضبط، ومفيش قسم مستخدم ولا "منها".
+    m = _mahmoud_shift()
+    text = R.build_shift_report(m, _NO_COMPARISON)
+    lines = _daybook_lines(text)
+    assert "+17,580" in lines["مبيعات"], lines["مبيعات"]
+    assert "+2,150" in lines["مقبوضات"], lines["مقبوضات"]
+    assert "−445" in lines["دليفري"], lines["دليفري"]
+    assert "−0" in lines["مرتجع مبيعات"], lines["مرتجع مبيعات"]
+    assert lines["الإجمالي"].endswith("19,285 ج"), lines["الإجمالي"]
+    assert "الإجمالي = مبيعات + مقبوضات − مرتجع مبيعات − دليفري" in text
+    assert "👤 نشاط مستخدم آخر" not in text
+    assert "↳ منها" not in text
+
+
+def test_withdrawals_unchanged_with_user_section():
+    # TEST 7 — المسحوبات زي ما هي بالضبط حتى مع وجود قسم المستخدم:
+    # السطر والفورمولا والإجمالي من نفس الأساس، مفيش تداخل.
+    m = _mahmoud_shift(withdrawals=150.0)      # 19,285 − 150 = 19,135
+    m.primary_user = M.UserSlice(uid=2, name="حمص", invoices=238,
+                                 amount=15950.0)
+    m.other_users = [M.UserSlice(uid=1, name="محمود", invoices=24,
+                                 amount=1630.0)]
+    text = R.build_shift_report(m, _NO_COMPARISON, withdrawals=150.0)
+    line = [ln for ln in text.splitlines() if ln.startswith("مسحوبات")][0]
+    assert "−150" in line, line
+    assert "19,135" in text
+    assert ("الإجمالي = مبيعات + مقبوضات − مرتجع مبيعات − دليفري − مسحوبات"
+            in text)
+    assert "👤 نشاط مستخدم آخر" in text
 
 
 def test_report_is_arabic_and_passes_the_no_accusation_guard():
