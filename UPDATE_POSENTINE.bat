@@ -97,7 +97,7 @@ rem                 Empty = skip the pin; the updater still verifies
 rem                 every shipped file against MANIFEST.txt, which is
 rem                 the stronger gate.
 set "ZIP_NAME="
-set "EXPECTED_SHA=5629db77b9f5bff5b276aa1d9e329f8a5688c5d35b56a91d6a97fba6f7459659"
+set "EXPECTED_SHA=0876e536f292439d9af25cf6598747069e7fc8a6df410f7d16d5997f84754334"
 
 rem ---- build the command line ---------------------------------
 set "ARGS=-NoProfile -ExecutionPolicy Bypass -File "%~dp0install\update_agent.ps1" -DownloadsDir "C:\Users\Techno\Downloads""
