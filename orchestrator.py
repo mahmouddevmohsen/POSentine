@@ -774,6 +774,7 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
         "n_return": m.n_return,
         "n_external": m.n_external,
         "is_partial": is_partial,
+        "top_items": m.top_items,
     }
     if not is_partial:
         dedup = SHIFT_DEDUP.format(shift_date=shift_date.isoformat(),
