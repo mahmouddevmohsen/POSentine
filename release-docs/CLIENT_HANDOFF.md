@@ -61,7 +61,8 @@ Runs automatically every 3 minutes on the till, reads what changed, and uploads 
 
 ## Who to contact for support
 
-(Contact details to be filled in by the owner/operator before this document is shared externally.)
+**Phone / WhatsApp:** 01033052885
+**Email:** mahmoudmohsen.work@gmail.com
 
 ---
 

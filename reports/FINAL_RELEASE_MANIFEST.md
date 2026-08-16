@@ -141,3 +141,90 @@ The code and repository are ready. Every gate that can be closed without the own
 What remains is exactly the set of things only the owner can do: choose the deployment architecture, authenticate and run the Vercel deploy, and then let the live smoke test close the loop.
 
 Not starting Phase 4. Not expanding scope. Stopping here.
+
+---
+
+## SESSION UPDATE — Forensic audit + status-bug fix + final handoff closure (same day)
+
+### A. Financial reconciliation (Aug 11–13, real Telegram baseline)
+
+| Date | Shift | Telegram | Supabase | Dashboard | Result |
+|---|---|---:|---:|---:|---|
+| 08-11 | Morning | 18,785 | 18,785 | 18,785 | ✅ match |
+| 08-11 | Evening | 18,630 | 18,630 | 18,630 | ✅ match |
+| 08-12 | Morning | 19,285 | 19,285 | 19,285 | ✅ match |
+| 08-12 | Evening | 19,185 | 19,185 | 19,185 | ✅ match |
+| 08-13 | Morning | 20,705 | 20,705 | 20,705 | ✅ match |
+| 08-13 | Evening | *no report (`(9).txt` empty)* | 7,015 (sales 19,745, withdrawals 14,510) | 7,015 | ⚪ unverifiable — real Supabase/dashboard data, no Telegram report exists to cross-check |
+
+40/40 checked financial fields exact matches across the 5 verifiable shifts. Zero fabricated values found anywhere reachable from live mode.
+
+### B. Status reconciliation
+
+| Date | Shift | Real status | Dashboard status (before fix) | Dashboard status (after fix) |
+|---|---|---|---|---|
+| 08-11 | Morning | 🟡 تحتاج مراجعة | 🟠 غير مكتملة ❌ | 🟡 تحتاج مراجعة ✅ |
+| 08-11 | Evening | 🟠 غير مكتملة | 🟠 غير مكتملة ✅ | 🟠 غير مكتملة ✅ |
+| 08-12 | Morning | 🟠 غير مكتملة | 🟠 غير مكتملة ✅ | 🟠 غير مكتملة ✅ |
+| 08-12 | Evening | 🟠 غير مكتملة | 🟠 غير مكتملة ✅ | 🟠 غير مكتملة ✅ |
+| 08-13 | Morning | 🟠 غير مكتملة | 🟠 غير مكتملة ✅ | 🟠 غير مكتملة ✅ |
+| 08-13 | Evening | *no baseline* | 🟠 غير مكتملة (unverified guess) | 🟢 مكتملة (still unverified — no Telegram baseline exists) |
+
+**Root cause:** `decorateFromBeats()` (dc.html) had no upper bound on its per-shift heartbeat window and compared a raw beat count against 240 instead of measuring silence duration — for any shift older than the ~10-hour lookback the fetch actually covered, this silently manufactured a false coverage gap on nearly every historical shift. Verified in a standalone Python simulation against live Supabase heartbeats/events before touching any code: the corrected algorithm (longest inter-heartbeat silence ≥ `COVERAGE_GAP_MINUTES=20`, inside a ±10min-padded window, in the same Cairo-local→UTC conversion `orchestrator.py` uses) reproduced all 5 known real statuses exactly. Implemented, then re-verified identically live against production.
+
+`gap_explained` (device-Sleep/POS-activity classification) is intentionally not reproduced — that data is backend-only and never persisted anywhere the frontend can read. A real-but-backend-explained gap will still show INCOMPLETE instead of the backend's STABLE. Documented as a known, honest residual limitation in the source comment.
+
+### C. Fake/demo audit
+
+| Value | Location | Demo/Live | Client-visible? | Action |
+|---|---|---|---|---|
+| Mock shifts s5–s10 (SHIFT_DOMAIN, dc.html) | Overview/Shifts/Cashbook | Demo only, explicitly commented `MOCK` in source | Only in demo mode, always badged | None needed — safely isolated |
+| `8,540 MB/10,240 MB/83%` db-size | Alerts/Health | Was demo only | No — removed prior session, reconfirmed absent this pass | Already fixed |
+| Coverage-gap false positive | Shifts/Overview/Cashbook (status field) | **Live** | **Yes — real client-visible defect** | **Fixed this pass** |
+| Alert cards showing generic text instead of real facts | Alerts (live) | Live | Yes, but not misleading (just uninformative) | Fixed this pass — real receipt #/user/amount now surfaced from the event's own payload |
+| "آخر 5 أيام" stale label | Overview/Shifts/Products | Both (accurate in demo, stale in live) | Yes, cosmetic only | Fixed this pass — now dynamic |
+
+### D. Missing data
+
+- Aug 13 evening Telegram report — genuinely absent (`(9).txt` is 0 bytes). Owner action: **"Send me the Telegram report for Thursday, 13 August 2026, evening shift (محمود)."** The dashboard's 14,510 ج withdrawal figure for that shift is real Supabase data, unverified against any independent source.
+- Products screen top-items — intentional limitation, documented in source (`mapShiftRow`'s `items: []` — avoids the dashboard recomputing raw invoices client-side and duplicating the backend's authoritative calculation).
+- Users-screen aggregation (محمود/حمص invoice/amount totals) — not independently re-derived digit-by-digit this pass; flagged as not exhaustively checked, not as wrong.
+
+### E. Production verification
+
+- URL: `https://posentine-dashboard.vercel.app`, deployment `dpl_C2a7EUXNPzYV7XUCEanau8m7cTiW`, `target: production`, `READY`.
+- Screens tested: all 7, both demo and live mode, on the actual production URL (not just local).
+- Console errors: 0, in every pass.
+- Demo mode: correct badge, nav badge `5` (not `6`), no misleading numbers.
+- Live mode: real tenant data, Aug 11 morning correctly shows REVIEW, all other real shifts unchanged and correct, real alert facts visible, dynamic "آخر 14 يوم" labels correct.
+
+### F. Tests — exact counts, this pass
+
+| Suite | Result |
+|---|---|
+| `dashboard/verify_dashboard.mjs` | **224/225 passed** (1 known, root-caused, non-code failure — see below) |
+| `dashboard/browser_check.py` | **22/22** |
+| `pytest` | **610 passed / 3 failed** (2 pre-existing environmental `NoDefaultCurrentDirectoryInExePath`; 1 artifact-selection timing edge case — see below) |
+| `reports/_phase3_reconcile.py` | PASS, re-run, unaffected by this session's changes |
+
+**Harness failure (1):** `three real reports present matching SHIFT_DOMAIN REAL entries` now correctly reports `0` instead of crashing. Root cause: the original 3 evidence files (Aug 14–15, matching `SHIFT_DOMAIN`'s REAL fixture entries) were replaced during an earlier audit turn with 5 new Aug 11–13 reports + 1 empty file — none of which map to the old fixture dates. The harness previously crashed outright on the empty file (`who.split('—')` on `null`) and hardcoded an assumption of exactly 3 files; both are now fixed to be robust, and the check now honestly reports what it finds (0 files match) rather than crashing or silently passing. Not a code regression — the underlying claim (Aug 14–15 SHIFT_DOMAIN entries are real) was independently reconfirmed via live Supabase query this session.
+
+**Pytest failures (3):**
+1–2. Pre-existing, environmental (`cmd`'s `NoDefaultCurrentDirectoryInExePath` registry setting on this dev machine), unrelated to any code, reproduced identically across every run this project.
+3. `test_artifact_carrying_protected_files_is_refused` — investigated in depth. Root cause: `update_agent.ps1` selects the "newest" release artifact via `Sort-Object LastWriteTime`; in the test, a legitimate and a malicious zip are written back-to-back and can land within the same filesystem timestamp resolution, so the malicious one sometimes doesn't win the tie and its `"contains a protected name"` gate is never reached. In every observed run, the update still correctly failed and rolled back — just via a different (also correct) gate, later in the pipeline. **Classified as a narrow test-timing/robustness gap, not a proven safety bypass** — no run has ever resulted in the malicious artifact actually being applied. Given the real-world safety property held in every execution and `update_agent.ps1` is a mature, field-proven, production-critical script outside this session's tested scope, it was deliberately **not modified** — changing artifact-selection logic without dedicated Windows-updater test coverage carries more real risk than the narrow issue it would close. Documented here in full rather than silently touched.
+
+### G. Remaining issues
+
+- 🔴 **BLOCKER: none.**
+- 🟡 **NON-BLOCKING:** the pytest artifact-selection timing edge case (F.3) and the harness's now-honest 0/3 real-report match (F, harness) — both fully documented, neither affects the shipped dashboard.
+- 🟢 **OPTIONAL ENHANCEMENT:** improve `update_agent.ps1`'s artifact selection to be timestamp-tie-resistant (e.g., prefer an explicit `-ZipName` pin or embed a monotonic build sequence rather than relying on filesystem mtime) — a separate, dedicated piece of work.
+- 🔵 **INTENTIONAL LIMITATION:** Products screen top-items in live mode; `gap_explained` (Sleep-classification) not reproduced client-side; Aug 13 evening unverifiable against Telegram.
+
+### Files changed this session
+
+- `dashboard/POSentine Arabic Dashboard/POSentine Dashboard.dc.html` — status-bug fix, alert facts, dynamic labels (gitignored, not in git status)
+- `dashboard/verify_dashboard.mjs` — robustness fix for the REAL REPORTS section (gitignored, not in git status)
+- `release-docs/CLIENT_HANDOFF.md` — support contact filled in (tracked, shown in `git status`)
+- This file
+
+No locked backend file touched. No secret exposed, committed, or printed.
