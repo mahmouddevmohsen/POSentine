@@ -19,6 +19,27 @@ Docs/
 # repo; the customer's raw POS data must never land there.
 data UN/
 
+# ── Forensic/audit reports carrying real customer machine data ──
+# reports/ itself is not blanket-ignored — most of it (verification scripts,
+# the Phase-1/2/3 audit reports) is intended project documentation. Only the
+# specific subpaths below carry real customer identity, hostnames, SQL data
+# dumps, or Telegram screenshots (found un-ignored during the 2026-08-16
+# final closure audit, in a PUBLIC repo — a routine `git add -A` would have
+# published them).
+reports/reports from telegram/
+reports/report from clint PC/
+reports/session_report.md
+reports/FINAL_CUSTOMER_FORENSIC_VALIDATION_REPORT.txt
+reports/FINAL_MASTER_FORENSIC_REPORT.txt
+reports/TOOLING_SETUP_REPORT.md
+
+# ── Customer dashboard deliverable — real business data inside ──
+# The dashboard carries the customer's shifts, cash counts, cashier
+# names and product data in its fixture. The repo is PUBLIC: a routine
+# `git add -A` must never publish it. It will be shipped deliberately
+# (git add -f / un-ignore) as part of the Supabase integration phase.
+dashboard/
+
 # ── Built artefact — never committed ────────────────────────────
 # ship/ is assembled by make_ship.py from the files in this repository.
 # Committing a second copy of agent.py is precisely how the customer
