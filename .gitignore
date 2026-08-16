@@ -32,6 +32,9 @@ reports/session_report.md
 reports/FINAL_CUSTOMER_FORENSIC_VALIDATION_REPORT.txt
 reports/FINAL_MASTER_FORENSIC_REPORT.txt
 reports/TOOLING_SETUP_REPORT.md
+# One-time historical backfill SQL (2026-08-16) — real cashier names and
+# real product/quantity data as literal values, same reason as the block above.
+schema_v11_backfill_top_items_other_users.sql
 
 # ── Customer dashboard deliverable — real business data inside ──
 # The dashboard carries the customer's shifts, cash counts, cashier
