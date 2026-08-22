@@ -634,6 +634,55 @@ def _sum_withdrawals(withdrawals: Sequence[Withdrawal],
                      if start <= w.perdate < end), 2)
 
 
+def _withdrawal_user_name(uid: int | None, names: dict[int, str]) -> str:
+    """نفس اصطلاح الاسم غير المعروف المستخدم أصلاً في metrics._user_name —
+    مفيش peruser (None) → "غير محدد"؛ uid موجود بس مش في pos_users
+    (مستخدم اتمسح من جدول Users) → "مستخدم محذوف #{uid}". بيانات عرض بس،
+    نفس اصطلاح other_users/primary_user بالظبط."""
+    if uid is None:
+        return "غير محدد"
+    if names.get(uid):
+        return names[uid]
+    return f"مستخدم محذوف #{uid}"
+
+
+def _group_withdrawals_by_user(withdrawals: Sequence[Withdrawal],
+                               start: _dt.datetime, end: _dt.datetime,
+                               user_names: dict[int, str]) -> list[dict]:
+    """مسحوبات الوردية مجمّعة بـ peruser — **بيانات عرض فقط**.
+
+    نفس فلتر النافذة اللي _sum_withdrawals بيستخدمه بالظبط (بداية شاملة /
+    نهاية غير شاملة) — مجموع amount هنا على كل الصفوف لازم يساوي
+    _sum_withdrawals على نفس الصفوف (مثبت باختبار)، لكن القيمة دي **مش**
+    مصدر الإجمالي المالي ولا بتتغذى فيه — عرض بديل بس لنفس الصفوف اللي
+    _sum_withdrawals أصلاً بيجمعها بالنافذة. التجميع هنا بالمستخدم عشان
+    العرض، والتجميع المالي المعتمد يفضل بالنافذة زي ما هو (rows.py/
+    metrics.py docstrings).
+
+    ترتيب حتمي: amount تنازلي، بعدين name، بعدين uid — عشان النص يفضل
+    ثابت بين تشغيلتين على نفس البيانات (مفيش ترتيب عشوائي من dict).
+    """
+    totals: dict[int | None, list] = {}   # uid -> [count, amount]
+    for w in withdrawals:
+        if start <= w.perdate < end:
+            entry = totals.setdefault(w.user_uid, [0, 0.0])
+            entry[0] += 1
+            entry[1] += w.amount
+
+    rows = [
+        {
+            "uid": uid,
+            "name": _withdrawal_user_name(uid, user_names),
+            "count": count,
+            "amount": round(amount, 2),
+        }
+        for uid, (count, amount) in totals.items()
+    ]
+    rows.sort(key=lambda r: (-r["amount"], r["name"],
+                             -1 if r["uid"] is None else r["uid"]))
+    return rows
+
+
 def _event_row(ev: E.Event, ctx: TenantContext, status: str) -> dict:
     return {
         "tenant_id": ctx.tenant_id,
@@ -666,6 +715,10 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
     # بيترسبوا كـ metadata على الصفوف نفسها، لكن التجميع بالنافذة مش بالكاشير
     # (ممنوع حرق أسماء الكاشير في الحساب، و ممنوع الحساب المزدوج).
     withdrawals = _sum_withdrawals(state.withdrawals, start, end)
+    # نفس النافذة بالظبط، تجميع عرض بديل بـ peruser — مفيش تأثير على
+    # withdrawals (الإجمالي المالي) أعلاه، ومفيش قراءة تانية للجدول.
+    withdrawal_users = _group_withdrawals_by_user(state.withdrawals, start, end,
+                                                  state.users)
 
     m = M.compute_shift(
         shift_date, shift_name, win_invs,
@@ -753,7 +806,8 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
                                 max_notes=MAX_REPORT_NOTES,
                                 has_coverage_gap=has_coverage_gap,
                                 gap_explained=gap_explained,
-                                withdrawals=m.withdrawals)
+                                withdrawals=m.withdrawals,
+                                withdrawal_users=withdrawal_users)
     E.assert_no_accusation(body)
 
     out.shift_row = {
@@ -779,6 +833,7 @@ def _build_shift_report(out: Plan, ctx: TenantContext, state: DBState,
             {"uid": u.uid, "name": u.name, "invoices": u.invoices, "amount": u.amount}
             for u in m.other_users
         ],
+        "withdrawal_users": withdrawal_users,
     }
     if not is_partial:
         dedup = SHIFT_DEDUP.format(shift_date=shift_date.isoformat(),

@@ -203,6 +203,7 @@ def build_shift_report(
     has_coverage_gap: bool = False,
     gap_explained: bool = False,
     withdrawals: float | None = None,
+    withdrawal_users: Sequence[dict] | None = None,
 ) -> str:
     """بيرجّع نص جاهز للإرسال. مبيحسبش أي رقم — كله جاي من metrics.
 
@@ -212,6 +213,12 @@ def build_shift_report(
     صفر) — السطر ممنوع يختفي ولا يتحط من غير أساس. المبلغ نفسه سطر عرض بس:
     الإجمالي محسوب بنفس الأساس في metrics.py (مبيعات + مقبوضات − مرتجع
     − دليفري − مسحوبات).
+
+    withdrawal_users: نفس صفوف orchestrator._group_withdrawals_by_user —
+    **بيانات عرض فقط**. مبلغ "مسحوبات" أعلاه يفضل هو المصدر المعتمد؛ القسم
+    ده بيوريه مين سحب، مبيضيفش رقم تاني ولا بيغيّر الإجمالي. بيتعرض بس لو
+    أكتر من مستخدم واحد سحب في الوردية (زي منطق other_users بالظبط) — مستخدم
+    واحد مفيهوش معلومة إضافية تستاهل قسم لوحده.
     """
     has_cash = cash_event is not None
     has_notes = bool(notes)
@@ -256,6 +263,18 @@ def build_shift_report(
                      f"{_ar_invoice_count(u.invoices)} — {M.money(u.amount)} ج")
         L.append("ℹ️ قيمة هذه الفواتير محسوبة ضمن بيانات الوردية "
                  "ولا تُضاف على الإجمالي.")
+        L.append(SEP)
+
+    # ── مين سحب (2026-08-22) ─────────────────────────────────────────────
+    # قسم عرض إضافي **فقط** لو أكتر من مستخدم واحد سحب جوه نافذة الوردية —
+    # نفس منطق قسم "نشاط مستخدم آخر" فوق بالظبط: مستخدم واحد مفيهوش معلومة
+    # إضافية تستاهل قسم لوحده (هو أصلاً صاحب الوردية غالباً). القيم هنا
+    # عرض فقط ومحسوبة أصلاً ضمن سطر "مسحوبات" تحت — ممنوع تتحط كإجمالي
+    # تاني منافس، وممنوع تتغيّر الإجمالي المعتمد بسببها.
+    if withdrawal_users and len(withdrawal_users) > 1:
+        L.append("💸 المسحوبات")
+        for wu in withdrawal_users:
+            L.append(f"{wu['name']} — {M.money(wu['amount'])} ج")
         L.append(SEP)
 
     # بنود يومية الخزينة — بنفس ترتيب شاشة "يومية الخزينة" المعتمدة.

@@ -303,6 +303,30 @@ def test_empty_withdrawals_keep_the_verified_formula():
     assert out.shift_row["grand_total"] == 100.0
 
 
+def test_shift_row_carries_withdrawal_users_alongside_the_unchanged_total():
+    """schema_v12 (2026-08-22): withdrawal_users rides alongside withdrawals,
+    same pattern as other_users/top_items — display metadata only, computed
+    from the SAME rows _sum_withdrawals already totals, never fed back into
+    grand_total. Companion of test_withdrawal_belongs_to_its_shift_not_its_cashier
+    above, which proves the financial side of this exact scenario."""
+    s = state(invoices=[inv(1, t(2026, 6, 30, 20, 0))],
+              withdrawals=[wdl(1, t(2026, 6, 30, 20, 30), amount=50.0, user=1),
+                           wdl(2, t(2026, 6, 30, 21, 0), amount=100.0, user=2)],
+              users={1: "محمود", 2: "حمص"})
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawals"] == 150.0            # unchanged financial total
+    wu = out.shift_row["withdrawal_users"]
+    assert {u["name"] for u in wu} == {"محمود", "حمص"}
+    assert sum(u["amount"] for u in wu) == 150.0             # equals withdrawals, never fed into it
+
+
+def test_withdrawal_users_empty_list_when_no_withdrawals():
+    """مفيش مسحوبات → withdrawal_users=[] (زي other_users)، مش None ولا خطأ."""
+    s = state(invoices=[inv(1, t(2026, 6, 30, 20, 0), total=100.0)])
+    out = orchestrator.plan(utc(2026, 7, 1, 4, 10), ctx(), s)
+    assert out.shift_row["withdrawal_users"] == []
+
+
 def test_previous_week_comparison_uses_withdrawals_on_both_sides():
     """المقارنة بنفس الوردية لازم تخصم مسحوبات الأسبوعين — قياس عادل.
     الأسبوع اللي فات محتاج ≥ 20 فاتورة (MIN_INVOICES_FOR_STATS) عشان

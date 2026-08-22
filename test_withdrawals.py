@@ -623,3 +623,163 @@ def test_zero_withdrawals_renders_a_zero_line():
         m, M.Comparison(False, reason="مفيش بيانات للأسبوع اللي فات"),
         withdrawals=0.0)
     assert "مسحوبات         −0 ج" in text
+
+
+# ════════════════════════════════════════════════════════════════
+# 10) _group_withdrawals_by_user — display metadata only (2026-08-22)
+# ════════════════════════════════════════════════════════════════
+
+def test_two_users_grouped_with_correct_totals():
+    # Test 1 — حمص 1000، محمود 400 → two entries, metadata total 1400
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "morning")
+    rows = [
+        wd(1, t(2026, 8, 11, 7, 30), amount=1000.0, user=2),   # حمص
+        wd(2, t(2026, 8, 11, 8, 0), amount=400.0, user=1),     # محمود
+    ]
+    users = OR._group_withdrawals_by_user(rows, start, end, {2: "حمص", 1: "محمود"})
+    assert len(users) == 2
+    assert sum(u["amount"] for u in users) == 1400.0
+    # doesn't touch the authoritative financial sum
+    assert OR._sum_withdrawals(rows, start, end) == 1400.0
+
+
+def test_same_user_multiple_withdrawals_are_counted_and_summed():
+    # Test 2 — حمص سحب 3 مرات: count=3, amount=1000
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "morning")
+    rows = [
+        wd(1, t(2026, 8, 11, 7, 10), amount=500.0, user=2),
+        wd(2, t(2026, 8, 11, 8, 10), amount=300.0, user=2),
+        wd(3, t(2026, 8, 11, 9, 10), amount=200.0, user=2),
+    ]
+    users = OR._group_withdrawals_by_user(rows, start, end, {2: "حمص"})
+    assert len(users) == 1
+    assert users[0]["count"] == 3
+    assert users[0]["amount"] == 1000.0
+
+
+def test_grouping_key_is_uid_not_display_name():
+    # Test 3 — two different uids that happen to resolve to different names
+    # must stay two separate groups; a uid absent from the map never merges
+    # into a uid that IS present just because both display as text.
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "morning")
+    rows = [
+        wd(1, t(2026, 8, 11, 7, 10), amount=50.0, user=2),
+        wd(2, t(2026, 8, 11, 8, 10), amount=75.0, user=5),   # uid 5: not in the map
+    ]
+    users = OR._group_withdrawals_by_user(rows, start, end, {2: "حمص"})
+    assert {u["uid"] for u in users} == {2, 5}
+    deleted = next(u for u in users if u["uid"] == 5)
+    assert deleted["name"] == "مستخدم محذوف #5"     # not fabricated, not merged
+
+
+def test_withdrawal_outside_window_excluded_from_breakdown():
+    # Test 4 — same exclusion _sum_withdrawals already proves, for the
+    # per-user breakdown too.
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "morning")
+    inside = wd(1, t(2026, 8, 11, 7, 0), amount=5.0, user=2)
+    outside = wd(2, t(2026, 8, 11, 19, 1), amount=99.0, user=2)
+    users = OR._group_withdrawals_by_user([inside, outside], start, end, {2: "حمص"})
+    assert len(users) == 1
+    assert users[0]["amount"] == 5.0
+
+
+def test_breakdown_boundary_matches_sum_withdrawals_exactly():
+    # Test 5 — perdate == start included, perdate == end excluded (same
+    # boundary _sum_withdrawals uses — proven identical here).
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "morning")
+    at_start = wd(1, start, amount=10.0, user=2)
+    at_end = wd(2, end, amount=20.0, user=2)
+    users = OR._group_withdrawals_by_user([at_start, at_end], start, end, {2: "حمص"})
+    assert len(users) == 1
+    assert users[0]["amount"] == 10.0
+    assert OR._sum_withdrawals([at_start, at_end], start, end) == 10.0
+
+
+def test_withdrawal_user_differs_from_shift_owner():
+    # Test 6 — the exact CONTEXT.md §8 scenario: evening shift owned by
+    # محمود, a withdrawal at 19:10 recorded by حمص. Financial attribution
+    # stays timestamp-based (evening); user attribution shows حمص, never
+    # silently reassigned to the shift's primary user.
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "evening")
+    w = wd(1, t(2026, 8, 11, 19, 10), amount=1400.0, user=2)   # حمص, uid 2
+    assert start <= w.perdate < end                            # financially: evening shift
+    users = OR._group_withdrawals_by_user([w], start, end, {2: "حمص", 1: "محمود"})
+    assert len(users) == 1
+    assert users[0]["name"] == "حمص"
+    assert users[0]["uid"] == 2
+    # never silently reassigned to محمود (uid 1), the shift's usual owner
+    assert users[0]["name"] != "محمود"
+
+
+def test_missing_user_uid_is_not_fabricated():
+    # Test 7 — peruser NULL → "غير محدد", never a guessed name.
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "morning")
+    w = wd(1, t(2026, 8, 11, 7, 30), amount=60.0, user=None)
+    users = OR._group_withdrawals_by_user([w], start, end, {2: "حمص"})
+    assert len(users) == 1
+    assert users[0]["uid"] is None
+    assert users[0]["name"] == "غير محدد"
+
+
+def test_grouping_never_changes_the_authoritative_financial_total():
+    # Test 8 — the financial invariant: _sum_withdrawals on the same rows
+    # returns exactly the same value whether or not the breakdown is ever
+    # computed, before and after this feature.
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "evening")
+    rows = [
+        wd(1, t(2026, 8, 11, 19, 10), amount=1000.0, user=2),
+        wd(2, t(2026, 8, 11, 20, 0), amount=400.0, user=1),
+    ]
+    before = OR._sum_withdrawals(rows, start, end)
+    OR._group_withdrawals_by_user(rows, start, end, {2: "حمص", 1: "محمود"})   # side-effect-free
+    after = OR._sum_withdrawals(rows, start, end)
+    assert before == after == 1400.0
+    m = M.compute_shift(_dt.date(2026, 8, 11), "evening", [], withdrawals=after)
+    assert m.grand_total == -1400.0                # sales/collections/etc. all 0 here
+
+
+def test_deterministic_ordering_amount_desc_name_asc_uid_asc():
+    start, end = M.shift_window(_dt.date(2026, 8, 11), "morning")
+    rows = [
+        wd(1, t(2026, 8, 11, 7, 10), amount=100.0, user=3),
+        wd(2, t(2026, 8, 11, 7, 20), amount=300.0, user=1),
+        wd(3, t(2026, 8, 11, 7, 30), amount=300.0, user=2),   # tie with uid=1 on amount
+    ]
+    names = {1: "ب", 2: "أ", 3: "ج"}
+    users = OR._group_withdrawals_by_user(rows, start, end, names)
+    # amount DESC first; the 300/300 tie breaks by name ASC ("أ" before "ب")
+    assert [u["amount"] for u in users] == [300.0, 300.0, 100.0]
+    assert [u["uid"] for u in users] == [2, 1, 3]
+    # deterministic across repeated calls on the same input
+    assert OR._group_withdrawals_by_user(rows, start, end, names) == users
+
+
+def test_report_shows_breakdown_only_for_more_than_one_user():
+    # Test 9 (Telegram) — single-user shifts stay simple (no redundant
+    # section); multi-user shifts show the breakdown; the aggregate total
+    # line is unaffected either way; no accusatory wording is introduced
+    # (assert_no_accusation runs inside build_shift_report itself).
+    import report as R
+    m = compute(sales=1000.0, collections=0.0, withdrawals=1400.0)
+    comparison = M.Comparison(False, reason="مفيش بيانات للأسبوع اللي فات")
+
+    single = R.build_shift_report(m, comparison, withdrawals=1400.0,
+                                  withdrawal_users=[{"uid": 2, "name": "حمص",
+                                                     "count": 1, "amount": 1400.0}])
+    assert "💸 المسحوبات" not in single
+    assert "مسحوبات         −1,400 ج" in single
+
+    multi = R.build_shift_report(m, comparison, withdrawals=1400.0,
+                                 withdrawal_users=[
+                                     {"uid": 2, "name": "حمص", "count": 3, "amount": 1000.0},
+                                     {"uid": 1, "name": "محمود", "count": 1, "amount": 400.0},
+                                 ])
+    assert "💸 المسحوبات" in multi
+    assert "حمص — 1,000 ج" in multi
+    assert "محمود — 400 ج" in multi
+    # the aggregate line is the SAME value regardless of the breakdown above it
+    assert "مسحوبات         −1,400 ج" in multi
+
+    none_ = R.build_shift_report(m, comparison, withdrawals=1400.0, withdrawal_users=[])
+    assert "💸 المسحوبات" not in none_
+    assert "مسحوبات         −1,400 ج" in none_
